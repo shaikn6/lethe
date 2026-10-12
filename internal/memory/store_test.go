@@ -467,3 +467,25 @@ func TestEventsDescribeEveryOperationWithoutContent(t *testing.T) {
 		t.Fatalf("feedback event = %+v", fb)
 	}
 }
+
+func TestNothingIsAcceptedAfterClose(t *testing.T) {
+	s := open(t, Options{JournalPath: filepath.Join(t.TempDir(), "store.journal")})
+	m := remember(t, s, Memory{Text: "stored before close"})
+	r := recall(t, s, Query{Text: "stored"})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close = %v, want nil", err)
+	}
+	_, rememberErr := s.Remember(Memory{Namespace: "ns", Text: "late write"})
+	_, recallErr := s.Recall(Query{Namespace: "ns", Text: "stored", K: 1})
+	for name, err := range map[string]error{
+		"Remember": rememberErr, "Recall": recallErr, "Forget": s.Forget("ns", m.ID),
+		"Feedback": s.Feedback(r.ID, 1, nil), "Compact": s.Compact(), "SetWeights": s.SetWeights(policy.Features{}),
+	} {
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("%s after Close = %v, want ErrClosed", name, err)
+		}
+	}
+}

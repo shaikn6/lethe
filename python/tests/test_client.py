@@ -85,3 +85,12 @@ def test_langchain_retriever_returns_documents_that_can_be_rated(server_url):
         assert docs[0].page_content.startswith("Railcards")
         assert docs[0].metadata["topic"] == "travel"
         memory.feedback(docs[0].metadata["recall_id"], 1.0, useful=[docs[0].metadata["memory_id"]])
+
+
+def test_a_crafted_id_cannot_reach_another_namespace(server_url):
+    with Lethe(server_url, namespace="alice") as alice, Lethe(server_url, namespace="bob") as bob:
+        secret = alice.remember("alice keeps her passport in the red folder")
+        for crafted in (f"../alice/{secret}", f"..%2Falice%2F{secret}", f"x/../../alice/{secret}"):
+            with pytest.raises(httpx.HTTPStatusError):
+                bob.forget(crafted)
+        assert [m.id for m in alice.recall("passport folder", explore=False).memories] == [secret]

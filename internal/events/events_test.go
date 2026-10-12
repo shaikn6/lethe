@@ -96,3 +96,26 @@ func TestRejectedRecordsAreCountedAsFailed(t *testing.T) {
 		t.Fatalf("counters = %+v, want 5 failed", c)
 	}
 }
+
+func TestPublishAfterCloseIsCountedNotFatal(t *testing.T) {
+	stream := NewStream(&fakeProducer{}, 8)
+	stream.Publish(memory.Event{Type: "recall", Namespace: "n"})
+	stream.Close(context.Background())
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				stream.Publish(memory.Event{Type: "recall", Namespace: "n"})
+			}
+		}()
+	}
+	wg.Wait()
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatalf("second Close = %v", err)
+	}
+	if c := stream.Counters(); c.Sent != 1 || c.Dropped != 800 {
+		t.Fatalf("counters = %+v, want 1 sent and 800 dropped", c)
+	}
+}

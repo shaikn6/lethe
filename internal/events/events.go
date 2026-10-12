@@ -37,7 +37,9 @@ type Stream struct {
 	producer Producer
 	queue    chan memory.Event
 	worker   sync.WaitGroup
-	closing  sync.Once
+
+	mu     sync.RWMutex // guards closed and the right to send on queue
+	closed bool
 
 	sent, dropped, failed atomic.Uint64
 }
@@ -67,8 +69,15 @@ func NewStream(producer Producer, buffer int) *Stream {
 	return s
 }
 
-// Publish queues an event without ever blocking.
+// Publish queues an event without ever blocking. After Close it only
+// counts the event as dropped.
 func (s *Stream) Publish(event memory.Event) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		s.dropped.Add(1)
+		return
+	}
 	select {
 	case s.queue <- event:
 	default:
@@ -82,14 +91,19 @@ func (s *Stream) Counters() Counters {
 }
 
 // Close stops accepting events, sends what is queued for as long as ctx
-// allows and closes the producer. Publish must not be called after Close.
+// allows and closes the producer. It is safe to call more than once.
 func (s *Stream) Close(ctx context.Context) error {
-	var err error
-	s.closing.Do(func() {
-		close(s.queue)
-		s.worker.Wait()
-		err = s.producer.Flush(ctx)
-		s.producer.Close()
-	})
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	close(s.queue)
+	s.mu.Unlock()
+
+	s.worker.Wait()
+	err := s.producer.Flush(ctx)
+	s.producer.Close()
 	return err
 }

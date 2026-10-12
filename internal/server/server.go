@@ -275,6 +275,8 @@ func writeError(w http.ResponseWriter, log *slog.Logger, err error) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, memory.ErrNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
+	case errors.Is(err, memory.ErrClosed):
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
 	case errors.Is(err, memory.ErrFull):
 		http.Error(w, "store is full", http.StatusInsufficientStorage)
 	default:

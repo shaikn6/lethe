@@ -77,11 +77,23 @@ func main() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdown)
+		if err := srv.Shutdown(shutdown); err != nil {
+			// Requests that would not finish in time are cut off. Any that are
+			// still mid-write are refused by the closed store below, so none
+			// is acknowledged without being journaled.
+			_ = srv.Close()
+		}
 	}()
 
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Error("server stopped", "error", err)
+	}
+	// Order matters: the store closes first so nothing can emit an event or
+	// touch the journal afterwards, then the event stream drains.
+	failed := false
+	if err := store.Close(); err != nil {
+		log.Error("close store", "error", err)
+		failed = true
 	}
 	if stream != nil {
 		flush, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -91,8 +103,7 @@ func main() {
 		cancel()
 		log.Info("event stream closed", "counters", stream.Counters())
 	}
-	if err := store.Close(); err != nil {
-		log.Error("close store", "error", err)
+	if failed {
 		os.Exit(1)
 	}
 	log.Info("shut down cleanly")

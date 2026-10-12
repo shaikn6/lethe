@@ -52,6 +52,8 @@ var (
 	ErrInvalid = errors.New("invalid request")
 	// ErrNotFound marks an unknown memory or recall.
 	ErrNotFound = errors.New("not found")
+	// ErrClosed means the store was closed; nothing is accepted any more.
+	ErrClosed = errors.New("store is closed")
 	// ErrFull means the store holds as many memories as it is allowed to.
 	ErrFull = errors.New("store is full")
 )
@@ -187,6 +189,7 @@ type Store struct {
 
 	dataMu     sync.RWMutex
 	spaces     map[string]*space
+	closed     bool
 	live       int
 	tombstones int   // forgets since the journal was last rewritten
 	compacted  int64 // journal size right after the last rewrite
@@ -272,11 +275,15 @@ func Open(opts Options) (*Store, error) {
 // error means some forgotten text may still be on disk; the next Open will
 // try again.
 func (s *Store) Close() error {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 	if s.journal == nil {
 		return nil
 	}
-	s.dataMu.Lock()
-	defer s.dataMu.Unlock()
 	var erase error
 	if s.tombstones > 0 {
 		erase = s.compactLocked()
@@ -330,6 +337,9 @@ func (s *Store) Remember(m Memory) (Memory, error) {
 
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
+	if s.closed {
+		return Memory{}, ErrClosed
+	}
 	if s.live >= s.opts.MaxMemories {
 		return Memory{}, ErrFull
 	}
@@ -376,6 +386,9 @@ func (s *Store) insert(m Memory) (*entry, error) {
 func (s *Store) Forget(namespace, id string) error {
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
 	sp := s.spaces[namespace]
 	if sp == nil {
 		return ErrNotFound
@@ -424,6 +437,9 @@ func (s *Store) remove(namespace, id string) {
 func (s *Store) Compact() error {
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
 	if s.tombstones == 0 && (s.journal == nil || s.journal.bytes() < 2*s.compacted+s.opts.CompactSlack) {
 		return nil
 	}
@@ -497,7 +513,10 @@ func (s *Store) Recall(q Query) (Recall, error) {
 		asOf = s.opts.Now()
 	}
 
-	found, features := s.candidates(q, asOf)
+	found, features, err := s.candidates(q, asOf)
+	if err != nil {
+		return Recall{}, err
+	}
 
 	p := &pending{id: newID(), namespace: q.Namespace, features: features, explore: q.Explore}
 	p.ids = make([]string, len(found))
@@ -536,12 +555,15 @@ func (s *Store) Recall(q Query) (Recall, error) {
 // candidates gathers the best keyword and semantic matches, adds the
 // memories stored right next to the strongest ones, and describes each for
 // the policy. Either search method alone is enough to answer.
-func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features) {
+func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features, error) {
 	s.dataMu.RLock()
 	defer s.dataMu.RUnlock()
+	if s.closed {
+		return nil, nil, ErrClosed
+	}
 	sp := s.spaces[q.Namespace]
 	if sp == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	pool := make(map[uint32]struct{})
@@ -628,7 +650,7 @@ func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features
 			f[policy.NeighborSemantic] = math.Max(f[policy.NeighborSemantic], weight*similarity(sp.entries[n]))
 		})
 	}
-	return found, features
+	return found, features, nil
 }
 
 // eachNeighbor calls visit for the live memories stored just before and
@@ -670,6 +692,9 @@ func (s *Store) Feedback(recallID string, reward float64, useful []string) error
 	}
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
 	s.learnMu.Lock()
 	defer s.learnMu.Unlock()
 
@@ -752,6 +777,9 @@ func (s *Store) SetWeights(weights policy.Features) error {
 	}
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
 	s.learnMu.Lock()
 	defer s.learnMu.Unlock()
 	if s.journal != nil {

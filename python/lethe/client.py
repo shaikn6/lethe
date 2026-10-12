@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Self
+from urllib.parse import quote
 
 import httpx
 
@@ -124,7 +125,10 @@ class Lethe:
 
     def forget(self, memory_id: str) -> None:
         """Delete a memory."""
-        self._http.delete(f"/v1/memories/{self.namespace}/{memory_id}").raise_for_status()
+        # Both parts are escaped so that an id such as "../other/x" stays an
+        # id and can never address a different namespace.
+        path = f"/v1/memories/{quote(self.namespace, safe='')}/{quote(memory_id, safe='')}"
+        self._http.delete(path).raise_for_status()
 
     def _post(self, path: str, body: dict) -> dict:
         response = self._http.post(path, json=body)
