@@ -25,6 +25,7 @@ import socket
 import statistics
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Self
@@ -201,8 +202,14 @@ class Server:
         return self.http.get("/healthz").json()["weights"]
 
     def ingest(self, conversations: list[dict]) -> None:
-        """Store every turn and remember which memory holds which turn."""
-        for conv in conversations:
+        """Store every turn and remember which memory holds which turn.
+
+        Conversations are loaded in parallel, but the turns of each one go in
+        order, because the server treats memories stored next to each other
+        as neighbours.
+        """
+
+        def load_one(conv: dict) -> None:
             conv["memory_to_dia"] = {}
             for turn in conv["turns"]:
                 stored = self.post(
@@ -216,6 +223,9 @@ class Server:
                 )
                 conv["memory_to_dia"][stored["id"]] = turn["dia_id"]
             conv["dia_to_memory"] = {d: m for m, d in conv["memory_to_dia"].items()}
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(load_one, conversations))
 
     def recall(
         self, conv: dict, question: dict, k: int, explore: bool
@@ -238,7 +248,11 @@ class Server:
 
 
 def evaluate(server: Server, conversations: list[dict]) -> list[dict]:
-    """Greedy recall for every question; one row per question."""
+    """Greedy recall for every question; one row per question.
+
+    When a question lists evidence sessions, the row also says what share of
+    those sessions had at least one turn returned.
+    """
     rows = []
     for conv in conversations:
         for question in conv["questions"]:
@@ -248,6 +262,10 @@ def evaluate(server: Server, conversations: list[dict]) -> list[dict]:
                 got = question["evidence"] & set(found[:k])
                 row[f"recall@{k}"] = len(got) / len(question["evidence"])
                 row[f"hit@{k}"] = float(bool(got))
+                sessions = question.get("evidence_sessions")
+                if sessions:
+                    seen = {d.rsplit(":", 1)[0] for d in found[:k]}
+                    row[f"session@{k}"] = len(sessions & seen) / len(sessions)
             rows.append(row)
     return rows
 
@@ -281,12 +299,13 @@ def train(
             server.post("/v1/feedback", body)
 
 
-def summarize(rows: list[dict]) -> dict:
+def summarize(rows: list[dict], categories: dict | None = None) -> dict:
     """Average each metric overall and per question category."""
+    categories = CATEGORIES if categories is None else categories
     out = {"questions": len(rows)}
-    for metric in [f"{m}@{k}" for k in KS for m in ("recall", "hit")]:
+    for metric in sorted({key for row in rows for key in row} - {"category"}):
         out[metric] = statistics.fmean(r[metric] for r in rows)
-        for cat, name in CATEGORIES.items():
+        for cat, name in categories.items():
             subset = [r[metric] for r in rows if r["category"] == cat]
             if subset:
                 out[f"{metric} {name}"] = statistics.fmean(subset)
