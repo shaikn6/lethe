@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 
 	"github.com/shaikn6/lethe/internal/policy"
 )
@@ -32,12 +33,14 @@ type forgetEntry struct {
 }
 
 type learnEntry struct {
-	Weights   policy.Features `json:"weights"`
-	Baseline  float64         `json:"baseline"`
-	Updates   int             `json:"updates"`
-	Namespace string          `json:"namespace,omitempty"`
-	IDs       []string        `json:"ids,omitempty"`
-	Reward    float64         `json:"reward,omitempty"`
+	Weights      policy.Features `json:"weights"`
+	Baseline     float64         `json:"baseline"`
+	ItemBaseline float64         `json:"item_baseline,omitempty"`
+	Updates      int             `json:"updates"`
+	Namespace    string          `json:"namespace,omitempty"`
+	IDs          []string        `json:"ids,omitempty"`
+	Reward       float64         `json:"reward,omitempty"`
+	ItemRewards  []float64       `json:"item_rewards,omitempty"`
 }
 
 // journalFile is the part of *os.File the journal uses, so tests can make
@@ -152,8 +155,14 @@ func (j *journal) replace(write func(emit func(record) error) error) error {
 	if j.broken != nil {
 		return j.broken
 	}
-	tmpPath := j.path + ".compact"
-	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	// The copy has a predictable name, so it is created exclusively and
+	// without following links: whatever sits at that path is removed, never
+	// written through.
+	tmpPath := j.path + compactSuffix
+	if err := os.Remove(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
 	}
@@ -192,6 +201,12 @@ func (j *journal) replace(write func(emit func(record) error) error) error {
 	j.file.Close()
 	j.file, j.size = tmp, size
 	return nil
+}
+
+func (j *journal) bytes() int64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.size
 }
 
 func (j *journal) healthy() bool {

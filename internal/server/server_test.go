@@ -9,10 +9,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/shaikn6/lethe/internal/memory"
 )
+
+const adminToken = "admin-secret"
+
+var asAdmin = []string{"Authorization", "Bearer " + adminToken}
 
 func newHandler(t testing.TB, token string) http.Handler {
 	return newHandlerWith(t, token, memory.Options{Seed: 1})
@@ -25,7 +31,8 @@ func newHandlerWith(t testing.TB, token string, opts memory.Options) http.Handle
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	return New(store, token, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cfg := Config{Token: token, AdminToken: adminToken, CompactEvery: time.Hour}
+	return New(store, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func do(h http.Handler, method, path, body string, headers ...string) *httptest.ResponseRecorder {
@@ -163,19 +170,19 @@ func FuzzAPI(f *testing.F) {
 
 func TestSetPolicyWeights(t *testing.T) {
 	h := newHandler(t, "")
-	if rec := do(h, "PUT", "/v1/policy", `{"weights":[1,0,3,0,0,0,0]}`); rec.Code != http.StatusNoContent {
+	if rec := do(h, "PUT", "/v1/policy", `{"weights":[1,0,3,0,0,0,0,0,0]}`, asAdmin...); rec.Code != http.StatusNoContent {
 		t.Fatalf("set weights: %d %s", rec.Code, rec.Body)
 	}
-	if rec := do(h, "GET", "/healthz", ""); !strings.Contains(rec.Body.String(), `"weights":[1,0,3,0,0,0,0]`) {
+	if rec := do(h, "GET", "/healthz", ""); !strings.Contains(rec.Body.String(), `"weights":[1,0,3,0,0,0,0,0,0]`) {
 		t.Fatalf("healthz = %s", rec.Body)
 	}
 	for name, body := range map[string]string{
 		"missing":   `{}`,
-		"too many":  `{"weights":[1,2,3,4,5,6,7,8]}`,
+		"too many":  `{"weights":[1,2,3,4,5,6,7,8,9,10]}`,
 		"too few":   `{"weights":[1,2,3]}`,
-		"too large": `{"weights":[1e9,0,0,0,0,0,0]}`,
+		"too large": `{"weights":[1e9,0,0,0,0,0,0,0,0]}`,
 	} {
-		if rec := do(h, "PUT", "/v1/policy", body); rec.Code != http.StatusBadRequest {
+		if rec := do(h, "PUT", "/v1/policy", body, asAdmin...); rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", name, rec.Code)
 		}
 	}
@@ -201,8 +208,11 @@ func TestCompactErasesForgottenTextFromTheJournal(t *testing.T) {
 	}
 	json.Unmarshal(rec.Body.Bytes(), &stored)
 	do(h, "DELETE", "/v1/memories/n/"+stored.ID, "")
-	if rec := do(h, "POST", "/v1/compact", ""); rec.Code != http.StatusNoContent {
+	if rec := do(h, "POST", "/v1/compact", "", asAdmin...); rec.Code != http.StatusNoContent {
 		t.Fatalf("compact: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do(h, "POST", "/v1/compact", "", asAdmin...); rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("second compact right away: %d, want 429 with Retry-After", rec.Code)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -213,5 +223,68 @@ func TestCompactErasesForgottenTextFromTheJournal(t *testing.T) {
 	}
 	if rec := do(h, "GET", "/healthz", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"journal_healthy":true`) {
 		t.Fatalf("healthz = %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestAdminEndpointsNeedTheAdminToken(t *testing.T) {
+	h := newHandler(t, "data-token")
+	weights := `{"weights":[1,0,0,0,0,0,0,0,0]}`
+	for name, headers := range map[string][]string{
+		"no token":   nil,
+		"data token": {"Authorization", "Bearer data-token"},
+	} {
+		if rec := do(h, "PUT", "/v1/policy", weights, headers...); rec.Code != http.StatusUnauthorized {
+			t.Errorf("PUT /v1/policy with %s: %d, want 401", name, rec.Code)
+		}
+		if rec := do(h, "POST", "/v1/compact", "", headers...); rec.Code != http.StatusUnauthorized {
+			t.Errorf("POST /v1/compact with %s: %d, want 401", name, rec.Code)
+		}
+	}
+	if rec := do(h, "POST", "/v1/memories", `{"namespace":"n","text":"x"}`, asAdmin...); rec.Code != http.StatusUnauthorized {
+		t.Errorf("admin token on a data endpoint: %d, want 401", rec.Code)
+	}
+}
+
+func TestAdminEndpointsAreOffWithoutAnAdminToken(t *testing.T) {
+	store, err := memory.Open(memory.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(store, Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for _, req := range [][2]string{{"PUT", "/v1/policy"}, {"POST", "/v1/compact"}} {
+		if rec := do(h, req[0], req[1], `{"weights":[1,0,0,0,0,0,0,0,0]}`); rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s without an admin token configured: %d, want it unavailable", req[0], req[1], rec.Code)
+		}
+	}
+	if rec := do(h, "GET", "/healthz", ""); !strings.Contains(rec.Body.String(), `"weights":[2,2,0,0,0,0,0,0,0]`) {
+		t.Fatalf("weights changed without an admin token: %s", rec.Body)
+	}
+}
+
+func TestSheds503WhenAtCapacity(t *testing.T) {
+	release, entered := make(chan struct{}), make(chan struct{})
+	h := limitInFlight(1, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			close(entered)
+			<-release
+		}
+	}))
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		do(h, "GET", "/slow", "")
+	}()
+	<-entered
+	if rec := do(h, "GET", "/v1/recall", ""); rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Errorf("request beyond capacity: %d, want 503 with Retry-After", rec.Code)
+	}
+	if rec := do(h, "GET", "/healthz", ""); rec.Code != http.StatusOK {
+		t.Errorf("health check at capacity: %d, want 200", rec.Code)
+	}
+	close(release)
+	wg.Wait()
+	if rec := do(h, "GET", "/v1/recall", ""); rec.Code != http.StatusOK {
+		t.Errorf("after the slow request finished: %d, want 200", rec.Code)
 	}
 }

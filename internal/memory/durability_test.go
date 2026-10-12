@@ -101,7 +101,7 @@ func TestFeedbackAndWeightsNeverRunAheadOfTheJournal(t *testing.T) {
 	before := s.Stats()
 
 	disk := breakDisk(s)
-	if err := s.Feedback(r.ID, 1); !errors.Is(err, errDisk) {
+	if err := s.Feedback(r.ID, 1, nil); !errors.Is(err, errDisk) {
 		t.Fatalf("Feedback on a failing disk = %v, want the disk error", err)
 	}
 	var other policy.Features
@@ -115,7 +115,7 @@ func TestFeedbackAndWeightsNeverRunAheadOfTheJournal(t *testing.T) {
 	}
 
 	disk.failWrites = false
-	if err := s.Feedback(r.ID, 1); err != nil {
+	if err := s.Feedback(r.ID, 1, nil); err != nil {
 		t.Fatalf("retry after the disk recovered = %v", err)
 	}
 	if st := s.Stats(); st.Updates != before.Updates+1 || st.Pending != 0 {
@@ -199,13 +199,13 @@ func TestForgottenTextDoesNotSurviveARestartOrManyForgets(t *testing.T) {
 
 func TestCompactionKeepsRankingAndLearningAndShrinksTheJournal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.journal")
-	s := open(t, Options{JournalPath: path})
+	s := open(t, Options{JournalPath: path, CompactSlack: 1})
 	for i := range 40 {
 		remember(t, s, Memory{Text: fmt.Sprintf("meeting note %d about the budget", i), Embedding: []float32{float32(i % 7), float32(i % 5), 1}, CreatedAt: day0.AddDate(0, 0, i)})
 	}
 	for i := range 300 {
 		r := recall(t, s, Query{Text: "latest budget meeting note", Embedding: []float32{1, 2, 1}, Explore: true})
-		if err := s.Feedback(r.ID, float64(i%2)); err != nil {
+		if err := s.Feedback(r.ID, float64(i%2), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -295,7 +295,7 @@ func TestCompactionDuringConcurrentUse(t *testing.T) {
 						t.Error("recall returned an erased memory")
 					}
 				}
-				if err := s.Feedback(r.ID, float64(i%2)); err != nil {
+				if err := s.Feedback(r.ID, float64(i%2), nil); err != nil {
 					t.Error(err)
 					return
 				}
@@ -343,5 +343,81 @@ func sameRecall(t *testing.T, when string, got, want Recall) {
 		if got.Memories[i].ID != want.Memories[i].ID || got.Memories[i].Score != want.Memories[i].Score {
 			t.Fatalf("%s: position %d is %+v, want %+v", when, i, got.Memories[i], want.Memories[i])
 		}
+	}
+}
+
+func TestOpenRemovesAnInterruptedCompactionAndReportsUnerasedForgets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.journal")
+	s := open(t, Options{JournalPath: path})
+	gone := remember(t, s, Memory{Text: "pangolin55 must not survive"})
+	remember(t, s, Memory{Text: "this one stays"})
+	if err := s.Forget("ns", gone.ID); err != nil {
+		t.Fatal(err)
+	}
+	if st := s.Stats(); st.ForgottenOnDisk != 1 {
+		t.Fatalf("ForgottenOnDisk = %d, want 1 before compaction", st.ForgottenOnDisk)
+	}
+	// Simulate a crash: no Close, and a half-finished compaction copy on disk.
+	if err := os.WriteFile(path+compactSuffix, []byte(`{"remember":{"text":"pangolin55 stale copy"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.journal.close()
+
+	reopened := open(t, Options{JournalPath: path})
+	if _, err := os.Stat(path + compactSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("interrupted compaction copy still exists: %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	if bytes.Contains(data, []byte("pangolin55")) {
+		t.Fatal("forgotten text survived a restart")
+	}
+	if st := reopened.Stats(); st.ForgottenOnDisk != 0 || st.Memories != 1 {
+		t.Fatalf("stats after restart = %+v", st)
+	}
+}
+
+func TestCompactIsANoOpWhenThereIsNothingToDo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.journal")
+	s := open(t, Options{JournalPath: path})
+	remember(t, s, Memory{Text: "steady state"})
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 50 {
+		if err := s.Compact(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, _ := os.Stat(path)
+	if !os.SameFile(before, after) {
+		t.Fatal("Compact rewrote the journal although nothing had been forgotten")
+	}
+}
+
+func TestCompactionDoesNotWriteThroughAPlantedLink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.journal")
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("do not overwrite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := open(t, Options{JournalPath: path})
+	m := remember(t, s, Memory{Text: "to be forgotten"})
+	remember(t, s, Memory{Text: "to be kept"})
+	if err := os.Symlink(victim, path+compactSuffix); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Forget("ns", m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(victim); string(data) != "do not overwrite" {
+		t.Fatalf("compaction wrote through the link: victim now holds %q", data)
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("journal is not a regular file after compaction: %v %v", info, err)
 	}
 }

@@ -13,6 +13,8 @@ import (
 	// Exploration sampling has to be seedable so experiments can be repeated;
 	// it is not used for anything secret. IDs come from crypto/rand.
 	mrand "math/rand/v2" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used
+	"os"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -31,6 +33,15 @@ const (
 	MaxMetadataKeyLen = 128
 	MaxMetadataValLen = 1024
 	MaxK              = 100
+
+	// Neighbours are memories stored next to each other within this gap, such
+	// as consecutive turns of one conversation.
+	defaultNeighborGap = time.Hour
+	neighborReach      = 2  // how many positions away still counts
+	neighborSeeds      = 25 // best hits per search method whose neighbours join the pool
+
+	compactSuffix       = ".compact"
+	defaultCompactSlack = 1 << 20
 
 	defaultMaxMemories = 1_000_000
 	defaultCompact     = 1000
@@ -87,14 +98,16 @@ type Options struct {
 	JournalPath  string // empty keeps everything in memory only
 	Fsync        bool   // fsync every journal write
 	Candidates   int    // per search method, default 50
-	MaxPending   int    // recalls kept waiting for feedback, default 10000
+	MaxPending   int    // recalls kept waiting for feedback, default 4096
 	MaxMemories  int    // live memories across all namespaces, default 1,000,000
 	CompactAfter int    // forgets before the journal is rewritten, default 1000
+	CompactSlack int64  // journal growth in bytes that Compact ignores, default 1 MiB
 	Seed         uint64 // exploration seed, 0 picks a random one
 	Now          func() time.Time
 
-	LearningRate float64 // 0 keeps the policy default
-	Temperature  float64 // 0 keeps the policy default
+	NeighborGap  time.Duration // how close in time adjacent memories must be to count as neighbours, default 1h
+	LearningRate float64       // 0 keeps the policy default
+	Temperature  float64       // 0 keeps the policy default
 }
 
 // Stats is a snapshot for health checks and monitoring.
@@ -109,6 +122,9 @@ type Stats struct {
 	// JournalHealthy is false once the journal file can no longer be
 	// written safely; the store then refuses writes instead of losing them.
 	JournalHealthy bool `json:"journal_healthy"`
+	// ForgottenOnDisk counts forgotten memories whose text is still in the
+	// journal file, waiting for the next compaction. It should return to 0.
+	ForgottenOnDisk int `json:"forgotten_on_disk"`
 }
 
 type entry struct {
@@ -155,7 +171,8 @@ type Store struct {
 	dataMu     sync.RWMutex
 	spaces     map[string]*space
 	live       int
-	tombstones int // forgets since the journal was last rewritten
+	tombstones int   // forgets since the journal was last rewritten
+	compacted  int64 // journal size right after the last rewrite
 
 	learnMu sync.Mutex
 	policy  *policy.Policy
@@ -173,13 +190,19 @@ func Open(opts Options) (*Store, error) {
 		opts.Candidates = 50
 	}
 	if opts.MaxPending <= 0 {
-		opts.MaxPending = 10000
+		opts.MaxPending = 4096
+	}
+	if opts.NeighborGap <= 0 {
+		opts.NeighborGap = defaultNeighborGap
 	}
 	if opts.MaxMemories <= 0 {
 		opts.MaxMemories = defaultMaxMemories
 	}
 	if opts.CompactAfter <= 0 {
 		opts.CompactAfter = defaultCompact
+	}
+	if opts.CompactSlack <= 0 {
+		opts.CompactSlack = defaultCompactSlack
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -204,31 +227,44 @@ func Open(opts Options) (*Store, error) {
 		order:   list.New(),
 	}
 	if opts.JournalPath != "" {
+		// A compaction interrupted by a crash leaves its unfinished copy
+		// behind; it may hold memories that were forgotten since.
+		if err := os.Remove(opts.JournalPath + compactSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 		j, err := openJournal(opts.JournalPath, opts.Fsync, s.replay)
 		if err != nil {
 			return nil, err
 		}
 		s.journal = j
-		// Forgotten memories are still in the file that was just replayed;
-		// rewrite it now so they do not outlive this start.
+		s.compacted = j.bytes()
+		// Forgotten memories are still in the file that was just replayed.
+		// Rewrite it now so they do not outlive this start, and refuse to
+		// start if that is impossible rather than keep them silently.
 		if s.tombstones > 0 {
-			_ = s.compactLocked()
+			if err := s.compactLocked(); err != nil {
+				j.close()
+				return nil, err
+			}
 		}
 	}
 	return s, nil
 }
 
-// Close erases forgotten memories from the journal and releases it.
+// Close erases forgotten memories from the journal and releases it. An
+// error means some forgotten text may still be on disk; the next Open will
+// try again.
 func (s *Store) Close() error {
 	if s.journal == nil {
 		return nil
 	}
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
+	var erase error
 	if s.tombstones > 0 {
-		_ = s.compactLocked()
+		erase = s.compactLocked()
 	}
-	return s.journal.close()
+	return errors.Join(erase, s.journal.close())
 }
 
 func (s *Store) replay(rec record) error {
@@ -244,8 +280,9 @@ func (s *Store) replay(rec record) error {
 	case rec.Learn != nil:
 		s.policy.Weights = rec.Learn.Weights
 		s.policy.Baseline = rec.Learn.Baseline
+		s.policy.ItemBaseline = rec.Learn.ItemBaseline
 		s.policy.Updates = rec.Learn.Updates
-		s.credit(rec.Learn.Namespace, rec.Learn.IDs, rec.Learn.Reward)
+		s.credit(rec.Learn.Namespace, rec.Learn.IDs, rec.Learn.Reward, rec.Learn.ItemRewards)
 	}
 	return nil
 }
@@ -336,7 +373,10 @@ func (s *Store) Forget(namespace, id string) error {
 	}
 	s.remove(namespace, id)
 	if s.tombstones >= s.opts.CompactAfter {
-		_ = s.compactLocked() // the forget itself is already durable
+		// The forget is already durable. If the rewrite fails it is counted
+		// in JournalErrors, ForgottenOnDisk stays above zero, and the next
+		// forget tries again.
+		_ = s.compactLocked()
 	}
 	return nil
 }
@@ -360,9 +400,14 @@ func (s *Store) remove(namespace, id string) {
 
 // Compact rewrites the journal so it holds only live memories and the
 // current learning state, and frees what forgotten memories still occupy.
+// It does nothing when there is nothing to erase and the journal has not
+// grown much, so calling it often is cheap.
 func (s *Store) Compact() error {
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
+	if s.tombstones == 0 && (s.journal == nil || s.journal.bytes() < 2*s.compacted+s.opts.CompactSlack) {
+		return nil
+	}
 	return s.compactLocked()
 }
 
@@ -388,12 +433,16 @@ func (s *Store) compactLocked() error {
 			}
 			s.learnMu.Lock()
 			defer s.learnMu.Unlock()
-			return emit(record{Learn: &learnEntry{Weights: s.policy.Weights, Baseline: s.policy.Baseline, Updates: s.policy.Updates}})
+			return emit(record{Learn: &learnEntry{
+				Weights: s.policy.Weights, Baseline: s.policy.Baseline,
+				ItemBaseline: s.policy.ItemBaseline, Updates: s.policy.Updates,
+			}})
 		})
 		if err != nil {
 			s.journalErrors.Add(1)
 			return fmt.Errorf("journal compaction failed: %w", err)
 		}
+		s.compacted = s.journal.bytes()
 	}
 	for name, sp := range s.spaces {
 		if sp.live == len(sp.entries) {
@@ -460,8 +509,9 @@ func (s *Store) Recall(q Query) (Recall, error) {
 	return out, nil
 }
 
-// candidates gathers the best keyword and semantic matches and describes
-// each one for the policy. Either method alone is enough to answer.
+// candidates gathers the best keyword and semantic matches, adds the
+// memories stored right next to the strongest ones, and describes each for
+// the policy. Either search method alone is enough to answer.
 func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features) {
 	s.dataMu.RLock()
 	defer s.dataMu.RUnlock()
@@ -470,16 +520,27 @@ func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features
 		return nil, nil
 	}
 
+	pool := make(map[uint32]struct{})
 	keyword := make(map[uint32]float64)
 	var best float64
-	for _, hit := range sp.ix.Search(q.Text, s.opts.Candidates) {
+	for i, hit := range sp.ix.Search(q.Text, s.opts.Candidates) {
 		keyword[hit.Doc] = hit.Score
 		best = math.Max(best, hit.Score)
+		pool[hit.Doc] = struct{}{}
+		if i < neighborSeeds {
+			s.eachNeighbor(sp, hit.Doc, func(n uint32, _ int) { pool[n] = struct{}{} })
+		}
 	}
 
 	semantic := make(map[uint32]bool)
 	qNorm := norm(q.Embedding)
 	useVectors := qNorm > 0 && len(q.Embedding) == sp.dim
+	similarity := func(e *entry) float64 {
+		if !useVectors || e.norm == 0 {
+			return 0
+		}
+		return math.Max(0, cosine(q.Embedding, e.Embedding, qNorm, e.norm))
+	}
 	if useVectors {
 		type scored struct {
 			doc uint32
@@ -497,19 +558,18 @@ func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features
 			}
 			return all[i].doc < all[j].doc
 		})
-		for _, sc := range all[:min(s.opts.Candidates, len(all))] {
+		for i, sc := range all[:min(s.opts.Candidates, len(all))] {
 			semantic[sc.doc] = true
+			pool[sc.doc] = struct{}{}
+			if i < neighborSeeds {
+				s.eachNeighbor(sp, sc.doc, func(n uint32, _ int) { pool[n] = struct{}{} })
+			}
 		}
 	}
 
-	docs := make([]uint32, 0, len(keyword)+len(semantic))
-	for doc := range keyword {
+	docs := make([]uint32, 0, len(pool))
+	for doc := range pool {
 		docs = append(docs, doc)
-	}
-	for doc := range semantic {
-		if _, dup := keyword[doc]; !dup {
-			docs = append(docs, doc)
-		}
 	}
 	sort.Slice(docs, func(i, j int) bool { return docs[i] < docs[j] })
 
@@ -527,9 +587,7 @@ func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features
 		if best > 0 {
 			f[policy.Keyword] = keyword[doc] / best
 		}
-		if useVectors && e.norm > 0 {
-			f[policy.Semantic] = math.Max(0, cosine(q.Embedding, e.Embedding, qNorm, e.norm))
-		}
+		f[policy.Semantic] = similarity(e)
 		ageDays := math.Max(0, asOf.Sub(e.CreatedAt).Hours()/24)
 		f[policy.Recency] = 1 / (1 + ageDays)
 		f[policy.Utility] = e.utility()
@@ -538,17 +596,51 @@ func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features
 		if _, inKeyword := keyword[doc]; inKeyword && semantic[doc] {
 			f[policy.Agreement] = 1
 		}
+		s.eachNeighbor(sp, doc, func(n uint32, distance int) {
+			weight := 1 / float64(distance)
+			if best > 0 {
+				f[policy.NeighborKeyword] = math.Max(f[policy.NeighborKeyword], weight*keyword[n]/best)
+			}
+			f[policy.NeighborSemantic] = math.Max(f[policy.NeighborSemantic], weight*similarity(sp.entries[n]))
+		})
 	}
 	return found, features
+}
+
+// eachNeighbor calls visit for the live memories stored just before and
+// after doc, as long as each step between them is within the neighbour gap.
+func (s *Store) eachNeighbor(sp *space, doc uint32, visit func(neighbor uint32, distance int)) {
+	for _, step := range []int{-1, 1} {
+		at := int(doc)
+		for distance := 1; distance <= neighborReach; distance++ {
+			next := at + step
+			if next < 0 || next >= len(sp.entries) || !sp.entries[next].alive {
+				break
+			}
+			gap := sp.entries[next].CreatedAt.Sub(sp.entries[at].CreatedAt)
+			if gap < 0 {
+				gap = -gap
+			}
+			if gap > s.opts.NeighborGap {
+				break
+			}
+			visit(uint32(next), distance)
+			at = next
+		}
+	}
 }
 
 // Feedback reports how useful a recall was, from 0 (useless) to 1 (it
 // answered the question). Each recall accepts feedback once.
 //
+// useful may name the returned memories that actually helped, for example
+// the ones an agent cited. The policy then learns from each memory's own
+// outcome instead of one number for the whole slate, which is far less noisy.
+//
 // The learning step and its journal record succeed or fail together: if the
 // record cannot be written, the policy is put back as it was and the recall
 // stays open, so the caller can retry and RAM never runs ahead of disk.
-func (s *Store) Feedback(recallID string, reward float64) error {
+func (s *Store) Feedback(recallID string, reward float64, useful []string) error {
 	if math.IsNaN(reward) || reward < 0 || reward > 1 {
 		return fmt.Errorf("%w: reward must be between 0 and 1", ErrInvalid)
 	}
@@ -562,18 +654,30 @@ func (s *Store) Feedback(recallID string, reward float64) error {
 		return ErrNotFound
 	}
 	p := el.Value.(*pending)
-	before := *s.policy
-	if p.explore {
-		s.policy.Update(p.features, p.slate, reward)
-	}
 	ids := make([]string, len(p.slate))
 	for i, at := range p.slate {
 		ids[i] = p.ids[at]
 	}
+	var itemRewards []float64
+	if useful != nil {
+		itemRewards = make([]float64, len(ids))
+		for _, id := range useful {
+			at := slices.Index(ids, id)
+			if at < 0 {
+				return fmt.Errorf("%w: memory %q was not returned by this recall", ErrInvalid, id)
+			}
+			itemRewards[at] = 1
+		}
+	}
+
+	before := *s.policy
+	if p.explore {
+		s.policy.Update(p.features, p.slate, reward, itemRewards)
+	}
 	if s.journal != nil {
 		err := s.journal.append(record{Learn: &learnEntry{
-			Weights: s.policy.Weights, Baseline: s.policy.Baseline, Updates: s.policy.Updates,
-			Namespace: p.namespace, IDs: ids, Reward: reward,
+			Weights: s.policy.Weights, Baseline: s.policy.Baseline, ItemBaseline: s.policy.ItemBaseline,
+			Updates: s.policy.Updates, Namespace: p.namespace, IDs: ids, Reward: reward, ItemRewards: itemRewards,
 		}})
 		if err != nil {
 			*s.policy = before
@@ -583,20 +687,25 @@ func (s *Store) Feedback(recallID string, reward float64) error {
 	}
 	s.order.Remove(el)
 	delete(s.waiting, recallID)
-	s.credit(p.namespace, ids, reward)
+	s.credit(p.namespace, ids, reward, itemRewards)
 	return nil
 }
 
-// credit records that the given memories were in a slate that earned reward.
-func (s *Store) credit(namespace string, ids []string, reward float64) {
+// credit records the outcome of a slate against each memory in it: its own
+// reward when the caller said which memories helped, else the slate's.
+func (s *Store) credit(namespace string, ids []string, reward float64, itemRewards []float64) {
 	sp := s.spaces[namespace]
 	if sp == nil {
 		return
 	}
-	for _, id := range ids {
+	for i, id := range ids {
 		if doc, ok := sp.byID[id]; ok {
+			earned := reward
+			if len(itemRewards) == len(ids) {
+				earned = itemRewards[i]
+			}
 			sp.entries[doc].recalls++
-			sp.entries[doc].rewardSum += reward
+			sp.entries[doc].rewardSum += earned
 		}
 	}
 }
@@ -641,6 +750,9 @@ func (s *Store) Stats() Stats {
 	st.JournalErrors = s.journalErrors.Load()
 	if s.journal != nil {
 		st.JournalHealthy = s.journal.healthy()
+		s.dataMu.RLock()
+		st.ForgottenOnDisk = s.tombstones
+		s.dataMu.RUnlock()
 	}
 	return st
 }

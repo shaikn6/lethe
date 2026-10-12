@@ -21,6 +21,7 @@ func main() {
 	journal := flag.String("journal", "lethe.journal", "journal file; empty keeps everything in memory")
 	fsync := flag.Bool("fsync", false, "fsync every journal write (survives power loss, slower)")
 	seed := flag.Uint64("seed", 0, "exploration seed; 0 picks a random one")
+	maxInFlight := flag.Int("max-inflight", 0, "requests served at once before others get 503; 0 keeps the default of 256")
 	maxMemories := flag.Int("max-memories", 0, "live memories the store accepts; 0 keeps the default of one million")
 	learningRate := flag.Float64("learning-rate", 0, "policy learning rate; 0 keeps the default")
 	temperature := flag.Float64("temperature", 0, "exploration temperature; 0 keeps the default")
@@ -39,8 +40,12 @@ func main() {
 	log.Info("store ready", "memories", stats.Memories, "policy_updates", stats.Updates, "addr", *addr)
 
 	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           server.New(store, os.Getenv("LETHE_TOKEN"), log),
+		Addr: *addr,
+		Handler: server.New(store, server.Config{
+			Token:       os.Getenv("LETHE_TOKEN"),
+			AdminToken:  os.Getenv("LETHE_ADMIN_TOKEN"),
+			MaxInFlight: *maxInFlight,
+		}, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

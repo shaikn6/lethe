@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/shaikn6/lethe/internal/memory"
@@ -44,11 +46,34 @@ type policyRequest struct {
 type feedbackRequest struct {
 	RecallID string   `json:"recall_id"`
 	Reward   *float64 `json:"reward"`
+	Useful   []string `json:"useful"` // optional: ids of the returned memories that helped
 }
 
-// New returns the API handler. When token is not empty, every /v1 request
-// must carry it as a bearer token.
-func New(store *memory.Store, token string, log *slog.Logger) http.Handler {
+// Config holds the settings of the HTTP API.
+type Config struct {
+	// Token protects the memory endpoints. Empty leaves them open, which is
+	// only reasonable on a loopback address.
+	Token string
+	// AdminToken protects the endpoints that change how the server behaves
+	// for everyone: setting the ranking weights and forcing a compaction.
+	// Empty switches those endpoints off.
+	AdminToken string
+	// MaxInFlight is how many requests are served at once before the rest
+	// are turned away with 503. Default 256.
+	MaxInFlight int
+	// CompactEvery is the shortest gap between compactions requested over
+	// the API, because each one briefly holds every other request. Default 30s.
+	CompactEvery time.Duration
+}
+
+// New returns the API handler.
+func New(store *memory.Store, cfg Config, log *slog.Logger) http.Handler {
+	if cfg.MaxInFlight <= 0 {
+		cfg.MaxInFlight = 256
+	}
+	if cfg.CompactEvery <= 0 {
+		cfg.CompactEvery = 30 * time.Second
+	}
 	mux := http.NewServeMux()
 
 	// Unhealthy means the journal can no longer be written: the server still
@@ -119,42 +144,83 @@ func New(store *memory.Store, token string, log *slog.Logger) http.Handler {
 			http.Error(w, "reward is required", http.StatusBadRequest)
 			return
 		}
-		if err := store.Feedback(req.RecallID, *req.Reward); err != nil {
+		if len(req.Useful) > memory.MaxK {
+			http.Error(w, "too many useful ids", http.StatusBadRequest)
+			return
+		}
+		if err := store.Feedback(req.RecallID, *req.Reward, req.Useful); err != nil {
 			writeError(w, log, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	mux.HandleFunc("POST /v1/compact", func(w http.ResponseWriter, _ *http.Request) {
-		if err := store.Compact(); err != nil {
-			writeError(w, log, err)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	})
+	root := http.NewServeMux()
+	root.Handle("/", authorize(cfg.Token, mux))
+	if cfg.AdminToken != "" {
+		admin := http.NewServeMux()
+		var lastCompact atomic.Int64
+		admin.HandleFunc("POST /v1/compact", func(w http.ResponseWriter, _ *http.Request) {
+			now, last := time.Now().UnixNano(), lastCompact.Load()
+			if wait := cfg.CompactEvery - time.Duration(now-last); last != 0 && wait > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+				http.Error(w, "compaction was requested moments ago", http.StatusTooManyRequests)
+				return
+			}
+			if !lastCompact.CompareAndSwap(last, now) {
+				http.Error(w, "compaction already requested", http.StatusTooManyRequests)
+				return
+			}
+			if err := store.Compact(); err != nil {
+				writeError(w, log, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		})
+		admin.HandleFunc("PUT /v1/policy", func(w http.ResponseWriter, r *http.Request) {
+			var req policyRequest
+			if !decode(w, r, &req) {
+				return
+			}
+			// A fixed-size array would silently drop or zero-fill a list of the
+			// wrong length, so the length is checked on a slice first.
+			if len(req.Weights) != policy.NumFeatures {
+				http.Error(w, fmt.Sprintf("weights must have exactly %d values", policy.NumFeatures), http.StatusBadRequest)
+				return
+			}
+			if err := store.SetWeights(policy.Features(req.Weights)); err != nil {
+				writeError(w, log, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		})
+		protected := authorize(cfg.AdminToken, admin)
+		root.Handle("POST /v1/compact", protected)
+		root.Handle("PUT /v1/policy", protected)
+	}
 
-	mux.HandleFunc("PUT /v1/policy", func(w http.ResponseWriter, r *http.Request) {
-		var req policyRequest
-		if !decode(w, r, &req) {
-			return
-		}
-		// A fixed-size array would silently drop or zero-fill a list of the
-		// wrong length, so the length is checked on a slice first.
-		if len(req.Weights) != policy.NumFeatures {
-			http.Error(w, fmt.Sprintf("weights must have exactly %d values", policy.NumFeatures), http.StatusBadRequest)
-			return
-		}
-		if err := store.SetWeights(policy.Features(req.Weights)); err != nil {
-			writeError(w, log, err)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	})
-
-	return recoverPanics(log, authorize(token, mux))
+	return recoverPanics(log, limitInFlight(cfg.MaxInFlight, root))
 }
 
+// limitInFlight sheds load instead of letting requests pile up without
+// bound. Health checks always get through.
+func limitInFlight(n int, next http.Handler) http.Handler {
+	slots := make(chan struct{}, n)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "server is at capacity", http.StatusServiceUnavailable)
+		}
+	})
+}
 func authorize(token string, next http.Handler) http.Handler {
 	if token == "" {
 		return next

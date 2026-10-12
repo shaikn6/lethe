@@ -71,7 +71,7 @@ func TestRecallByKeyword(t *testing.T) {
 	s := open(t, Options{})
 	remember(t, s, Memory{Text: "Priya is allergic to peanuts"})
 	remember(t, s, Memory{Text: "The quarterly report is due on Friday"})
-	got := recall(t, s, Query{Text: "what is Priya allergic to"})
+	got := recall(t, s, Query{Text: "what is Priya allergic to", K: 1})
 	if len(got.Memories) != 1 || got.Memories[0].Text != "Priya is allergic to peanuts" {
 		t.Fatalf("recall = %v", texts(got))
 	}
@@ -161,20 +161,20 @@ func TestFeedbackIsAcceptedOncePerRecall(t *testing.T) {
 	s := open(t, Options{})
 	remember(t, s, Memory{Text: "alpha"})
 	r := recall(t, s, Query{Text: "alpha", Explore: true})
-	if err := s.Feedback(r.ID, 1.5); !errors.Is(err, ErrInvalid) {
+	if err := s.Feedback(r.ID, 1.5, nil); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("out-of-range reward = %v, want ErrInvalid", err)
 	}
-	if err := s.Feedback(r.ID, 1); err != nil {
+	if err := s.Feedback(r.ID, 1, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Feedback(r.ID, 1); !errors.Is(err, ErrNotFound) {
+	if err := s.Feedback(r.ID, 1, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second feedback = %v, want ErrNotFound", err)
 	}
-	if err := s.Feedback("nope", 1); !errors.Is(err, ErrNotFound) {
+	if err := s.Feedback("nope", 1, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown recall = %v, want ErrNotFound", err)
 	}
 	empty := recall(t, s, Query{Text: "nothing matches this", Explore: true})
-	if err := s.Feedback(empty.ID, 0); err != nil {
+	if err := s.Feedback(empty.ID, 0, nil); err != nil {
 		t.Fatalf("feedback on an empty recall = %v, want nil", err)
 	}
 }
@@ -208,7 +208,7 @@ func TestLearnsFromFeedbackWhichMemoryToReturn(t *testing.T) {
 				reward = 1
 			}
 		}
-		if err := s.Feedback(r.ID, reward); err != nil {
+		if err := s.Feedback(r.ID, reward, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -229,7 +229,7 @@ func TestJournalRestoresMemoriesAndLearning(t *testing.T) {
 	}
 	for range 25 {
 		r := recall(t, s, Query{Text: "wifi password", Embedding: []float32{1, 0.1}, Explore: true})
-		if err := s.Feedback(r.ID, 1); err != nil {
+		if err := s.Feedback(r.ID, 1, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -313,7 +313,7 @@ func TestPendingRecallsAreBounded(t *testing.T) {
 	if st := s.Stats(); st.Pending != 10 {
 		t.Fatalf("pending = %d, want 10", st.Pending)
 	}
-	if err := s.Feedback(first.ID, 1); !errors.Is(err, ErrNotFound) {
+	if err := s.Feedback(first.ID, 1, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("feedback for an evicted recall = %v, want ErrNotFound", err)
 	}
 }
@@ -340,7 +340,7 @@ func TestConcurrentUse(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if err := s.Feedback(r.ID, float64(i%3)/2); err != nil {
+				if err := s.Feedback(r.ID, float64(i%3)/2, nil); err != nil {
 					t.Error(err)
 					return
 				}
@@ -404,5 +404,35 @@ func TestSetWeightsChangesRankingAndSurvivesRestart(t *testing.T) {
 	reopened := open(t, Options{JournalPath: path})
 	if got := reopened.Stats().Weights; got != recencyOnly {
 		t.Fatalf("weights after restart = %v, want %v", got, recencyOnly)
+	}
+}
+
+func TestFeedbackCanNameTheMemoriesThatHelped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.journal")
+	s := open(t, Options{JournalPath: path})
+	for i := range 6 {
+		remember(t, s, Memory{Text: fmt.Sprintf("holiday plan option %d", i), Embedding: []float32{float32(i), 1}})
+	}
+	q := Query{Text: "holiday plan option", Embedding: []float32{2, 1}, K: 3, Explore: true}
+	r := recall(t, s, q)
+	if err := s.Feedback(r.ID, 1, []string{"not-in-this-recall"}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("feedback naming a memory that was not returned = %v, want ErrInvalid", err)
+	}
+	helped := r.Memories[1].ID
+	if err := s.Feedback(r.ID, 1, []string{helped}); err != nil {
+		t.Fatal(err)
+	}
+	utility := func(st *Store, id string) float64 {
+		sp := st.spaces["ns"]
+		return sp.entries[sp.byID[id]].utility()
+	}
+	if got, other := utility(s, helped), utility(s, r.Memories[0].ID); got <= 0.5 || other >= 0.5 {
+		t.Fatalf("utility of the helpful memory = %.2f, of an unhelpful one = %.2f; want above and below 0.5", got, other)
+	}
+	want, stats := utility(s, helped), s.Stats()
+	s.Close()
+	reopened := open(t, Options{JournalPath: path})
+	if got := utility(reopened, helped); got != want || reopened.Stats().Weights != stats.Weights {
+		t.Fatalf("per-memory credit not restored: utility %.3f want %.3f", got, want)
 	}
 }
