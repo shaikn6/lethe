@@ -1,0 +1,8 @@
+bin/
+data/
+runs/
+bench/
+python/
+deploy/
+.git/
+*.journal

@@ -6,3 +6,7 @@ bin/
 runs/
 .pytest_cache/
 *.journal
+
+.terraform/
+*.tfstate*
+.terraform.lock.hcl

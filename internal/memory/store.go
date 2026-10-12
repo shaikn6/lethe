@@ -93,6 +93,19 @@ type Query struct {
 	Explore   bool      // sample from the policy so feedback can teach it
 }
 
+// Event describes one thing the store did. It carries ids and outcomes
+// only, never the text of a memory or a query.
+type Event struct {
+	Type      string    `json:"type"` // remember, forget, recall or feedback
+	At        time.Time `json:"at"`
+	Namespace string    `json:"namespace"`
+	RecallID  string    `json:"recall_id,omitempty"`
+	MemoryIDs []string  `json:"memory_ids,omitempty"`
+	Explore   bool      `json:"explore,omitempty"`
+	Reward    *float64  `json:"reward,omitempty"`
+	Useful    []string  `json:"useful,omitempty"`
+}
+
 // Options configures a Store. The zero value is an in-memory store.
 type Options struct {
 	JournalPath  string // empty keeps everything in memory only
@@ -104,6 +117,10 @@ type Options struct {
 	CompactSlack int64  // journal growth in bytes that Compact ignores, default 1 MiB
 	Seed         uint64 // exploration seed, 0 picks a random one
 	Now          func() time.Time
+
+	// OnEvent, when set, is told about every successful operation. It is
+	// called while the store holds its locks, so it must return at once.
+	OnEvent func(Event)
 
 	NeighborGap  time.Duration // how close in time adjacent memories must be to count as neighbours, default 1h
 	LearningRate float64       // 0 keeps the policy default
@@ -329,6 +346,7 @@ func (s *Store) Remember(m Memory) (Memory, error) {
 	if _, err := s.insert(m); err != nil {
 		return Memory{}, err
 	}
+	s.emit(Event{Type: "remember", Namespace: m.Namespace, MemoryIDs: []string{m.ID}})
 	return m, nil
 }
 
@@ -372,6 +390,7 @@ func (s *Store) Forget(namespace, id string) error {
 		}
 	}
 	s.remove(namespace, id)
+	s.emit(Event{Type: "forget", Namespace: namespace, MemoryIDs: []string{id}})
 	if s.tombstones >= s.opts.CompactAfter {
 		// The forget is already durable. If the rewrite fails it is counted
 		// in JournalErrors, ForgottenOnDisk stays above zero, and the next
@@ -506,6 +525,11 @@ func (s *Store) Recall(q Query) (Recall, error) {
 		delete(s.waiting, oldest.id)
 	}
 	s.waiting[p.id] = s.order.PushBack(p)
+	returned := make([]string, len(out.Memories))
+	for i, m := range out.Memories {
+		returned[i] = m.ID
+	}
+	s.emit(Event{Type: "recall", Namespace: q.Namespace, RecallID: p.id, MemoryIDs: returned, Explore: q.Explore})
 	return out, nil
 }
 
@@ -688,7 +712,15 @@ func (s *Store) Feedback(recallID string, reward float64, useful []string) error
 	s.order.Remove(el)
 	delete(s.waiting, recallID)
 	s.credit(p.namespace, ids, reward, itemRewards)
+	s.emit(Event{Type: "feedback", Namespace: p.namespace, RecallID: recallID, MemoryIDs: ids, Reward: &reward, Useful: useful})
 	return nil
+}
+
+func (s *Store) emit(e Event) {
+	if s.opts.OnEvent != nil {
+		e.At = s.opts.Now().UTC()
+		s.opts.OnEvent(e)
+	}
 }
 
 // credit records the outcome of a slate against each memory in it: its own

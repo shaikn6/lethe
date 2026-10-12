@@ -1,0 +1,36 @@
+#cloud-config
+# The journal volume gets a filesystem on first boot only; an existing one
+# is never overwritten, so replacing the instance keeps every memory.
+fs_setup:
+  - device: /dev/nvme1n1
+    filesystem: ext4
+    overwrite: false
+
+mounts:
+  - [/dev/nvme1n1, /data, ext4, "defaults,nofail", "0", "2"]
+
+packages:
+  - docker
+
+write_files:
+  - path: /usr/local/bin/lethe-start
+    permissions: "0700"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      chown 65532:65532 /data
+      # Tokens are read from SSM at start and passed through a root-only file.
+      umask 077
+      {
+        echo "LETHE_TOKEN=$(aws ssm get-parameter --region ${region} --name ${token} --with-decryption --query Parameter.Value --output text)"
+        echo "LETHE_ADMIN_TOKEN=$(aws ssm get-parameter --region ${region} --name ${admin_token} --with-decryption --query Parameter.Value --output text)"
+      } > /etc/lethe.env
+      docker run -d --name lethe --restart unless-stopped \
+        --env-file /etc/lethe.env \
+        --read-only --cap-drop ALL --security-opt no-new-privileges \
+        -p 8787:8787 -v /data:/data \
+        ${image}
+
+runcmd:
+  - systemctl enable --now docker
+  - /usr/local/bin/lethe-start

@@ -436,3 +436,34 @@ func TestFeedbackCanNameTheMemoriesThatHelped(t *testing.T) {
 		t.Fatalf("per-memory credit not restored: utility %.3f want %.3f", got, want)
 	}
 }
+
+func TestEventsDescribeEveryOperationWithoutContent(t *testing.T) {
+	var events []Event
+	s := open(t, Options{OnEvent: func(e Event) { events = append(events, e) }})
+	m := remember(t, s, Memory{Text: "private detail platypus31"})
+	r := recall(t, s, Query{Text: "private detail", Explore: true})
+	if err := s.Feedback(r.ID, 1, []string{m.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Forget("ns", m.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.Recall(Query{Namespace: "", Text: "invalid"}) // failures emit nothing
+
+	var types []string
+	for _, e := range events {
+		types = append(types, e.Type)
+		if e.At.IsZero() || e.Namespace != "ns" {
+			t.Fatalf("event missing time or namespace: %+v", e)
+		}
+		if raw := fmt.Sprintf("%+v", e); strings.Contains(raw, "platypus31") || strings.Contains(raw, "private detail") {
+			t.Fatalf("event leaks content: %s", raw)
+		}
+	}
+	if strings.Join(types, ",") != "remember,recall,feedback,forget" {
+		t.Fatalf("event types = %v", types)
+	}
+	if fb := events[2]; fb.RecallID != r.ID || fb.Reward == nil || *fb.Reward != 1 || fb.Useful[0] != m.ID {
+		t.Fatalf("feedback event = %+v", fb)
+	}
+}

@@ -64,6 +64,9 @@ type Config struct {
 	// CompactEvery is the shortest gap between compactions requested over
 	// the API, because each one briefly holds every other request. Default 30s.
 	CompactEvery time.Duration
+	// EventCounters, when set, is reported by the health check so that a
+	// stalled event log is visible.
+	EventCounters func() any
 }
 
 // New returns the API handler.
@@ -84,7 +87,14 @@ func New(store *memory.Store, cfg Config, log *slog.Logger) http.Handler {
 		if !stats.JournalHealthy {
 			status = http.StatusServiceUnavailable
 		}
-		writeJSON(w, status, stats)
+		body := struct {
+			memory.Stats
+			Events any `json:"events,omitempty"`
+		}{Stats: stats}
+		if cfg.EventCounters != nil {
+			body.Events = cfg.EventCounters()
+		}
+		writeJSON(w, status, body)
 	})
 
 	mux.HandleFunc("POST /v1/memories", func(w http.ResponseWriter, r *http.Request) {

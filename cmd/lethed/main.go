@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/shaikn6/lethe/internal/events"
 	"github.com/shaikn6/lethe/internal/memory"
 	"github.com/shaikn6/lethe/internal/server"
 )
@@ -23,14 +25,30 @@ func main() {
 	seed := flag.Uint64("seed", 0, "exploration seed; 0 picks a random one")
 	maxInFlight := flag.Int("max-inflight", 0, "requests served at once before others get 503; 0 keeps the default of 256")
 	maxMemories := flag.Int("max-memories", 0, "live memories the store accepts; 0 keeps the default of one million")
+	kafkaBrokers := flag.String("kafka-brokers", "", "comma-separated Kafka brokers; empty disables the event stream")
+	kafkaTopic := flag.String("kafka-topic", "lethe.events", "Kafka topic for the event stream")
 	learningRate := flag.Float64("learning-rate", 0, "policy learning rate; 0 keeps the default")
 	temperature := flag.Float64("temperature", 0, "exploration temperature; 0 keeps the default")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	var stream *events.Stream
+	var onEvent func(memory.Event)
+	var counters func() any
+	if *kafkaBrokers != "" {
+		producer, err := events.NewKafka(strings.Split(*kafkaBrokers, ","), *kafkaTopic)
+		if err != nil {
+			log.Error("kafka client", "error", err)
+			os.Exit(1)
+		}
+		stream = events.NewStream(producer, 8192)
+		onEvent = stream.Publish
+		counters = func() any { return stream.Counters() }
+	}
+
 	store, err := memory.Open(memory.Options{
 		JournalPath: *journal, Fsync: *fsync, Seed: *seed, MaxMemories: *maxMemories,
-		LearningRate: *learningRate, Temperature: *temperature,
+		LearningRate: *learningRate, Temperature: *temperature, OnEvent: onEvent,
 	})
 	if err != nil {
 		log.Error("open store", "error", err)
@@ -44,7 +62,7 @@ func main() {
 		Handler: server.New(store, server.Config{
 			Token:       os.Getenv("LETHE_TOKEN"),
 			AdminToken:  os.Getenv("LETHE_ADMIN_TOKEN"),
-			MaxInFlight: *maxInFlight,
+			MaxInFlight: *maxInFlight, EventCounters: counters,
 		}, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -64,6 +82,14 @@ func main() {
 
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Error("server stopped", "error", err)
+	}
+	if stream != nil {
+		flush, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := stream.Close(flush); err != nil {
+			log.Error("event stream did not drain", "error", err)
+		}
+		cancel()
+		log.Info("event stream closed", "counters", stream.Counters())
 	}
 	if err := store.Close(); err != nil {
 		log.Error("close store", "error", err)
