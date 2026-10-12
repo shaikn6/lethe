@@ -21,10 +21,16 @@ func main() {
 	journal := flag.String("journal", "lethe.journal", "journal file; empty keeps everything in memory")
 	fsync := flag.Bool("fsync", false, "fsync every journal write (survives power loss, slower)")
 	seed := flag.Uint64("seed", 0, "exploration seed; 0 picks a random one")
+	maxMemories := flag.Int("max-memories", 0, "live memories the store accepts; 0 keeps the default of one million")
+	learningRate := flag.Float64("learning-rate", 0, "policy learning rate; 0 keeps the default")
+	temperature := flag.Float64("temperature", 0, "exploration temperature; 0 keeps the default")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
-	store, err := memory.Open(memory.Options{JournalPath: *journal, Fsync: *fsync, Seed: *seed})
+	store, err := memory.Open(memory.Options{
+		JournalPath: *journal, Fsync: *fsync, Seed: *seed, MaxMemories: *maxMemories,
+		LearningRate: *learningRate, Temperature: *temperature,
+	})
 	if err != nil {
 		log.Error("open store", "error", err)
 		os.Exit(1)

@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,11 +15,16 @@ import (
 )
 
 func newHandler(t testing.TB, token string) http.Handler {
+	return newHandlerWith(t, token, memory.Options{Seed: 1})
+}
+
+func newHandlerWith(t testing.TB, token string, opts memory.Options) http.Handler {
 	t.Helper()
-	store, err := memory.Open(memory.Options{Seed: 1})
+	store, err := memory.Open(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	return New(store, token, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
@@ -152,4 +159,59 @@ func FuzzAPI(f *testing.F) {
 			}
 		}
 	})
+}
+
+func TestSetPolicyWeights(t *testing.T) {
+	h := newHandler(t, "")
+	if rec := do(h, "PUT", "/v1/policy", `{"weights":[1,0,3,0,0,0,0]}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("set weights: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do(h, "GET", "/healthz", ""); !strings.Contains(rec.Body.String(), `"weights":[1,0,3,0,0,0,0]`) {
+		t.Fatalf("healthz = %s", rec.Body)
+	}
+	for name, body := range map[string]string{
+		"missing":   `{}`,
+		"too many":  `{"weights":[1,2,3,4,5,6,7,8]}`,
+		"too few":   `{"weights":[1,2,3]}`,
+		"too large": `{"weights":[1e9,0,0,0,0,0,0]}`,
+	} {
+		if rec := do(h, "PUT", "/v1/policy", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", name, rec.Code)
+		}
+	}
+}
+
+func TestFullStoreReturns507(t *testing.T) {
+	h := newHandlerWith(t, "", memory.Options{MaxMemories: 1})
+	body := `{"namespace":"n","text":"x"}`
+	if rec := do(h, "POST", "/v1/memories", body); rec.Code != http.StatusCreated {
+		t.Fatalf("first write: %d", rec.Code)
+	}
+	if rec := do(h, "POST", "/v1/memories", body); rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("write to a full store: %d, want 507", rec.Code)
+	}
+}
+
+func TestCompactErasesForgottenTextFromTheJournal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "api.journal")
+	h := newHandlerWith(t, "", memory.Options{JournalPath: path})
+	rec := do(h, "POST", "/v1/memories", `{"namespace":"n","text":"secret aardvark7 token"}`)
+	var stored struct {
+		ID string `json:"id"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &stored)
+	do(h, "DELETE", "/v1/memories/n/"+stored.ID, "")
+	if rec := do(h, "POST", "/v1/compact", ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("compact: %d %s", rec.Code, rec.Body)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "aardvark7") {
+		t.Fatal("forgotten text is still on disk after compaction")
+	}
+	if rec := do(h, "GET", "/healthz", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"journal_healthy":true`) {
+		t.Fatalf("healthz = %d %s", rec.Code, rec.Body)
+	}
 }

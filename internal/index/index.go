@@ -102,6 +102,11 @@ func (ix *Index) Remove(doc uint32) {
 	ix.total -= uint64(ix.length[doc])
 	for _, token := range ix.terms[doc] {
 		ix.df[token]--
+		// A word that only removed documents used must not linger as a key.
+		if ix.df[token] == 0 {
+			delete(ix.df, token)
+			delete(ix.postings, token)
+		}
 	}
 	ix.terms[doc] = nil
 }

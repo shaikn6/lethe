@@ -3,12 +3,15 @@ package memory
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/shaikn6/lethe/internal/policy"
 )
 
 var day0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -365,5 +368,41 @@ func TestConcurrentUse(t *testing.T) {
 	reopened := open(t, Options{JournalPath: path})
 	if got := reopened.Stats(); got.Memories != kept || got.Updates != st.Updates {
 		t.Fatalf("after restart: %+v, want %d memories and %d updates", got, kept, st.Updates)
+	}
+}
+
+func TestSetWeightsChangesRankingAndSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.journal")
+	s := open(t, Options{JournalPath: path})
+	old := remember(t, s, Memory{Text: "status report", CreatedAt: day0})
+	recent := remember(t, s, Memory{Text: "status report", CreatedAt: day0.AddDate(0, 0, 59)})
+	q := Query{Text: "status report", K: 1}
+	if got := recall(t, s, q); got.Memories[0].ID != old.ID {
+		t.Fatalf("default ranking should tie-break to the older memory, got %+v", got.Memories[0])
+	}
+
+	var recencyOnly policy.Features
+	recencyOnly[policy.Recency] = 5
+	if err := s.SetWeights(recencyOnly); err != nil {
+		t.Fatal(err)
+	}
+	if got := recall(t, s, q); got.Memories[0].ID != recent.ID {
+		t.Fatalf("recency ranking returned %+v", got.Memories[0])
+	}
+
+	bad := recencyOnly
+	bad[policy.Keyword] = math.NaN()
+	if err := s.SetWeights(bad); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("SetWeights(NaN) = %v, want ErrInvalid", err)
+	}
+	bad[policy.Keyword] = policy.MaxWeight * 2
+	if err := s.SetWeights(bad); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("SetWeights(too large) = %v, want ErrInvalid", err)
+	}
+
+	s.Close()
+	reopened := open(t, Options{JournalPath: path})
+	if got := reopened.Stats().Weights; got != recencyOnly {
+		t.Fatalf("weights after restart = %v, want %v", got, recencyOnly)
 	}
 }

@@ -5,11 +5,13 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/shaikn6/lethe/internal/memory"
+	"github.com/shaikn6/lethe/internal/policy"
 )
 
 const (
@@ -35,6 +37,10 @@ type recallRequest struct {
 	Explore   bool      `json:"explore"`
 }
 
+type policyRequest struct {
+	Weights []float64 `json:"weights"`
+}
+
 type feedbackRequest struct {
 	RecallID string   `json:"recall_id"`
 	Reward   *float64 `json:"reward"`
@@ -45,8 +51,15 @@ type feedbackRequest struct {
 func New(store *memory.Store, token string, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 
+	// Unhealthy means the journal can no longer be written: the server still
+	// answers recalls but refuses writes, so whatever runs it should replace it.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, store.Stats())
+		stats := store.Stats()
+		status := http.StatusOK
+		if !stats.JournalHealthy {
+			status = http.StatusServiceUnavailable
+		}
+		writeJSON(w, status, stats)
 	})
 
 	mux.HandleFunc("POST /v1/memories", func(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +126,32 @@ func New(store *memory.Store, token string, log *slog.Logger) http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+	mux.HandleFunc("POST /v1/compact", func(w http.ResponseWriter, _ *http.Request) {
+		if err := store.Compact(); err != nil {
+			writeError(w, log, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("PUT /v1/policy", func(w http.ResponseWriter, r *http.Request) {
+		var req policyRequest
+		if !decode(w, r, &req) {
+			return
+		}
+		// A fixed-size array would silently drop or zero-fill a list of the
+		// wrong length, so the length is checked on a slice first.
+		if len(req.Weights) != policy.NumFeatures {
+			http.Error(w, fmt.Sprintf("weights must have exactly %d values", policy.NumFeatures), http.StatusBadRequest)
+			return
+		}
+		if err := store.SetWeights(policy.Features(req.Weights)); err != nil {
+			writeError(w, log, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	return recoverPanics(log, authorize(token, mux))
 }
 
@@ -160,6 +199,8 @@ func writeError(w http.ResponseWriter, log *slog.Logger, err error) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, memory.ErrNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
+	case errors.Is(err, memory.ErrFull):
+		http.Error(w, "store is full", http.StatusInsufficientStorage)
 	default:
 		log.Error("request failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)

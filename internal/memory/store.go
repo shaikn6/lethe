@@ -28,7 +28,12 @@ const (
 	MaxNamespaceBytes = 128
 	MaxEmbeddingDim   = 4096
 	MaxMetadata       = 32
+	MaxMetadataKeyLen = 128
+	MaxMetadataValLen = 1024
 	MaxK              = 100
+
+	defaultMaxMemories = 1_000_000
+	defaultCompact     = 1000
 )
 
 var (
@@ -36,6 +41,8 @@ var (
 	ErrInvalid = errors.New("invalid request")
 	// ErrNotFound marks an unknown memory or recall.
 	ErrNotFound = errors.New("not found")
+	// ErrFull means the store holds as many memories as it is allowed to.
+	ErrFull = errors.New("store is full")
 )
 
 // Memory is one stored item.
@@ -77,12 +84,17 @@ type Query struct {
 
 // Options configures a Store. The zero value is an in-memory store.
 type Options struct {
-	JournalPath string // empty keeps everything in memory only
-	Fsync       bool   // fsync every journal write
-	Candidates  int    // per search method, default 50
-	MaxPending  int    // recalls kept waiting for feedback, default 10000
-	Seed        uint64 // exploration seed, 0 picks a random one
-	Now         func() time.Time
+	JournalPath  string // empty keeps everything in memory only
+	Fsync        bool   // fsync every journal write
+	Candidates   int    // per search method, default 50
+	MaxPending   int    // recalls kept waiting for feedback, default 10000
+	MaxMemories  int    // live memories across all namespaces, default 1,000,000
+	CompactAfter int    // forgets before the journal is rewritten, default 1000
+	Seed         uint64 // exploration seed, 0 picks a random one
+	Now          func() time.Time
+
+	LearningRate float64 // 0 keeps the policy default
+	Temperature  float64 // 0 keeps the policy default
 }
 
 // Stats is a snapshot for health checks and monitoring.
@@ -94,6 +106,9 @@ type Stats struct {
 	Baseline      float64         `json:"reward_baseline"`
 	Weights       policy.Features `json:"weights"`
 	JournalErrors uint64          `json:"journal_errors"`
+	// JournalHealthy is false once the journal file can no longer be
+	// written safely; the store then refuses writes instead of losing them.
+	JournalHealthy bool `json:"journal_healthy"`
 }
 
 type entry struct {
@@ -114,6 +129,14 @@ type space struct {
 	live    int
 }
 
+func newSpace() *space { return &space{ix: index.New(), byID: make(map[string]uint32)} }
+
+func (sp *space) add(e *entry) {
+	sp.byID[e.ID] = sp.ix.Add(e.Text)
+	sp.entries = append(sp.entries, e)
+	sp.live++
+}
+
 type pending struct {
 	id        string
 	namespace string
@@ -123,13 +146,16 @@ type pending struct {
 	explore   bool
 }
 
-// Store is safe for concurrent use. Memory data and learning state have
-// separate locks and are never held together.
+// Store is safe for concurrent use. When both locks are needed, dataMu is
+// taken before learnMu. Every journal write happens under dataMu, which is
+// what lets a compaction take a consistent snapshot.
 type Store struct {
 	opts Options
 
-	dataMu sync.RWMutex
-	spaces map[string]*space
+	dataMu     sync.RWMutex
+	spaces     map[string]*space
+	live       int
+	tombstones int // forgets since the journal was last rewritten
 
 	learnMu sync.Mutex
 	policy  *policy.Policy
@@ -149,6 +175,12 @@ func Open(opts Options) (*Store, error) {
 	if opts.MaxPending <= 0 {
 		opts.MaxPending = 10000
 	}
+	if opts.MaxMemories <= 0 {
+		opts.MaxMemories = defaultMaxMemories
+	}
+	if opts.CompactAfter <= 0 {
+		opts.CompactAfter = defaultCompact
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
@@ -156,10 +188,17 @@ func Open(opts Options) (*Store, error) {
 	if seed == 0 {
 		seed = mrand.Uint64()
 	}
+	pol := policy.New()
+	if opts.LearningRate > 0 {
+		pol.LearningRate = opts.LearningRate
+	}
+	if opts.Temperature > 0 {
+		pol.Temperature = opts.Temperature
+	}
 	s := &Store{
 		opts:    opts,
 		spaces:  make(map[string]*space),
-		policy:  policy.New(),
+		policy:  pol,
 		rng:     mrand.New(mrand.NewPCG(seed, seed^0x9e3779b97f4a7c15)),
 		waiting: make(map[string]*list.Element),
 		order:   list.New(),
@@ -170,14 +209,24 @@ func Open(opts Options) (*Store, error) {
 			return nil, err
 		}
 		s.journal = j
+		// Forgotten memories are still in the file that was just replayed;
+		// rewrite it now so they do not outlive this start.
+		if s.tombstones > 0 {
+			_ = s.compactLocked()
+		}
 	}
 	return s, nil
 }
 
-// Close releases the journal.
+// Close erases forgotten memories from the journal and releases it.
 func (s *Store) Close() error {
 	if s.journal == nil {
 		return nil
+	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	if s.tombstones > 0 {
+		_ = s.compactLocked()
 	}
 	return s.journal.close()
 }
@@ -185,7 +234,11 @@ func (s *Store) Close() error {
 func (s *Store) replay(rec record) error {
 	switch {
 	case rec.Remember != nil:
-		return s.insert(*rec.Remember)
+		e, err := s.insert(*rec.Remember)
+		if err != nil {
+			return err
+		}
+		e.recalls, e.rewardSum = rec.Recalls, rec.RewardSum
 	case rec.Forget != nil:
 		s.remove(rec.Forget.Namespace, rec.Forget.ID)
 	case rec.Learn != nil:
@@ -205,6 +258,11 @@ func (s *Store) Remember(m Memory) (Memory, error) {
 	if len(m.Metadata) > MaxMetadata {
 		return Memory{}, fmt.Errorf("%w: at most %d metadata entries", ErrInvalid, MaxMetadata)
 	}
+	for key, value := range m.Metadata {
+		if len(key) > MaxMetadataKeyLen || len(value) > MaxMetadataValLen {
+			return Memory{}, fmt.Errorf("%w: metadata keys are limited to %d bytes and values to %d", ErrInvalid, MaxMetadataKeyLen, MaxMetadataValLen)
+		}
+	}
 	if math.IsNaN(m.Importance) || m.Importance < 0 || m.Importance > 1 {
 		return Memory{}, fmt.Errorf("%w: importance must be between 0 and 1", ErrInvalid)
 	}
@@ -218,6 +276,9 @@ func (s *Store) Remember(m Memory) (Memory, error) {
 
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
+	if s.live >= s.opts.MaxMemories {
+		return Memory{}, ErrFull
+	}
 	if sp := s.spaces[m.Namespace]; sp != nil && sp.dim != 0 && len(m.Embedding) != 0 && len(m.Embedding) != sp.dim {
 		return Memory{}, fmt.Errorf("%w: embedding has %d dimensions, namespace uses %d", ErrInvalid, len(m.Embedding), sp.dim)
 	}
@@ -228,34 +289,35 @@ func (s *Store) Remember(m Memory) (Memory, error) {
 			return Memory{}, fmt.Errorf("journal write failed: %w", err)
 		}
 	}
-	if err := s.insert(m); err != nil {
+	if _, err := s.insert(m); err != nil {
 		return Memory{}, err
 	}
 	return m, nil
 }
 
 // insert adds m to its namespace. The caller holds dataMu or is replaying.
-func (s *Store) insert(m Memory) error {
+func (s *Store) insert(m Memory) (*entry, error) {
 	sp := s.spaces[m.Namespace]
 	if sp == nil {
-		sp = &space{ix: index.New(), byID: make(map[string]uint32)}
+		sp = newSpace()
 		s.spaces[m.Namespace] = sp
 	}
 	if len(m.Embedding) != 0 {
 		if sp.dim == 0 {
 			sp.dim = len(m.Embedding)
 		} else if sp.dim != len(m.Embedding) {
-			return fmt.Errorf("%w: embedding has %d dimensions, namespace uses %d", ErrInvalid, len(m.Embedding), sp.dim)
+			return nil, fmt.Errorf("%w: embedding has %d dimensions, namespace uses %d", ErrInvalid, len(m.Embedding), sp.dim)
 		}
 	}
-	doc := sp.ix.Add(m.Text)
-	sp.entries = append(sp.entries, &entry{Memory: m, norm: norm(m.Embedding), alive: true})
-	sp.byID[m.ID] = doc
-	sp.live++
-	return nil
+	e := &entry{Memory: m, norm: norm(m.Embedding), alive: true}
+	sp.add(e)
+	s.live++
+	return e, nil
 }
 
-// Forget deletes a memory.
+// Forget deletes a memory. Its content is dropped from RAM at once and from
+// the journal file at the next compaction, which runs after CompactAfter
+// forgets, on Close, on the next Open, or when Compact is called.
 func (s *Store) Forget(namespace, id string) error {
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
@@ -273,6 +335,9 @@ func (s *Store) Forget(namespace, id string) error {
 		}
 	}
 	s.remove(namespace, id)
+	if s.tombstones >= s.opts.CompactAfter {
+		_ = s.compactLocked() // the forget itself is already durable
+	}
 	return nil
 }
 
@@ -286,10 +351,69 @@ func (s *Store) remove(namespace, id string) {
 		return
 	}
 	sp.ix.Remove(doc)
-	sp.entries[doc].alive = false
-	sp.entries[doc].Embedding = nil
+	*sp.entries[doc] = entry{} // drop the text, embedding and metadata
 	delete(sp.byID, id)
 	sp.live--
+	s.live--
+	s.tombstones++
+}
+
+// Compact rewrites the journal so it holds only live memories and the
+// current learning state, and frees what forgotten memories still occupy.
+func (s *Store) Compact() error {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	return s.compactLocked()
+}
+
+// compactLocked requires dataMu. If the rewrite fails the old journal is
+// still complete, so the failure is counted and the store keeps running.
+func (s *Store) compactLocked() error {
+	if s.journal != nil {
+		err := s.journal.replace(func(emit func(record) error) error {
+			names := make([]string, 0, len(s.spaces))
+			for name := range s.spaces {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				for _, e := range s.spaces[name].entries {
+					if !e.alive {
+						continue
+					}
+					if err := emit(record{Remember: &e.Memory, Recalls: e.recalls, RewardSum: e.rewardSum}); err != nil {
+						return err
+					}
+				}
+			}
+			s.learnMu.Lock()
+			defer s.learnMu.Unlock()
+			return emit(record{Learn: &learnEntry{Weights: s.policy.Weights, Baseline: s.policy.Baseline, Updates: s.policy.Updates}})
+		})
+		if err != nil {
+			s.journalErrors.Add(1)
+			return fmt.Errorf("journal compaction failed: %w", err)
+		}
+	}
+	for name, sp := range s.spaces {
+		if sp.live == len(sp.entries) {
+			continue
+		}
+		if sp.live == 0 {
+			delete(s.spaces, name)
+			continue
+		}
+		fresh := newSpace()
+		fresh.dim = sp.dim
+		for _, e := range sp.entries {
+			if e.alive {
+				fresh.add(e)
+			}
+		}
+		s.spaces[name] = fresh
+	}
+	s.tombstones = 0
+	return nil
 }
 
 // Recall returns up to q.K memories for the query.
@@ -314,6 +438,7 @@ func (s *Store) Recall(q Query) (Recall, error) {
 	}
 
 	s.learnMu.Lock()
+	defer s.learnMu.Unlock()
 	if q.Explore {
 		p.slate = s.policy.Sample(features, q.K, s.rng)
 	} else {
@@ -327,12 +452,11 @@ func (s *Store) Recall(q Query) (Recall, error) {
 			Metadata: m.Metadata, Score: s.policy.Score(features[at]),
 		}
 	}
-	s.waiting[p.id] = s.order.PushBack(p)
-	for s.order.Len() > s.opts.MaxPending {
+	for s.order.Len() >= s.opts.MaxPending {
 		oldest := s.order.Remove(s.order.Front()).(*pending)
 		delete(s.waiting, oldest.id)
 	}
-	s.learnMu.Unlock()
+	s.waiting[p.id] = s.order.PushBack(p)
 	return out, nil
 }
 
@@ -420,41 +544,46 @@ func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features
 
 // Feedback reports how useful a recall was, from 0 (useless) to 1 (it
 // answered the question). Each recall accepts feedback once.
+//
+// The learning step and its journal record succeed or fail together: if the
+// record cannot be written, the policy is put back as it was and the recall
+// stays open, so the caller can retry and RAM never runs ahead of disk.
 func (s *Store) Feedback(recallID string, reward float64) error {
 	if math.IsNaN(reward) || reward < 0 || reward > 1 {
 		return fmt.Errorf("%w: reward must be between 0 and 1", ErrInvalid)
 	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
 	s.learnMu.Lock()
+	defer s.learnMu.Unlock()
+
 	el, ok := s.waiting[recallID]
 	if !ok {
-		s.learnMu.Unlock()
 		return ErrNotFound
 	}
-	p := s.order.Remove(el).(*pending)
-	delete(s.waiting, recallID)
+	p := el.Value.(*pending)
+	before := *s.policy
 	if p.explore {
 		s.policy.Update(p.features, p.slate, reward)
 	}
-	learned := &learnEntry{
-		Weights: s.policy.Weights, Baseline: s.policy.Baseline, Updates: s.policy.Updates,
-		Namespace: p.namespace, Reward: reward,
+	ids := make([]string, len(p.slate))
+	for i, at := range p.slate {
+		ids[i] = p.ids[at]
 	}
-	s.learnMu.Unlock()
-
-	for _, at := range p.slate {
-		learned.IDs = append(learned.IDs, p.ids[at])
-	}
-	s.dataMu.Lock()
-	s.credit(p.namespace, learned.IDs, reward)
-	s.dataMu.Unlock()
-
-	// Losing a learning record costs one step of learning, not data, so a
-	// journal failure here is counted instead of failing the request.
 	if s.journal != nil {
-		if err := s.journal.append(record{Learn: learned}); err != nil {
+		err := s.journal.append(record{Learn: &learnEntry{
+			Weights: s.policy.Weights, Baseline: s.policy.Baseline, Updates: s.policy.Updates,
+			Namespace: p.namespace, IDs: ids, Reward: reward,
+		}})
+		if err != nil {
+			*s.policy = before
 			s.journalErrors.Add(1)
+			return fmt.Errorf("journal write failed: %w", err)
 		}
 	}
+	s.order.Remove(el)
+	delete(s.waiting, recallID)
+	s.credit(p.namespace, ids, reward)
 	return nil
 }
 
@@ -472,14 +601,36 @@ func (s *Store) credit(namespace string, ids []string, reward float64) {
 	}
 }
 
+// SetWeights replaces the learned weights, for example to roll back a policy
+// that learned from bad feedback or to pin a fixed ranking.
+func (s *Store) SetWeights(weights policy.Features) error {
+	for _, w := range weights {
+		if math.IsNaN(w) || math.Abs(w) > policy.MaxWeight {
+			return fmt.Errorf("%w: weights must be finite and within ±%v", ErrInvalid, policy.MaxWeight)
+		}
+	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	s.learnMu.Lock()
+	defer s.learnMu.Unlock()
+	if s.journal != nil {
+		err := s.journal.append(record{Learn: &learnEntry{Weights: weights, Baseline: 0.5, Updates: s.policy.Updates}})
+		if err != nil {
+			s.journalErrors.Add(1)
+			return fmt.Errorf("journal write failed: %w", err)
+		}
+	}
+	s.policy.Weights = weights
+	s.policy.Baseline = 0.5
+	return nil
+}
+
 // Stats returns a snapshot of the store.
 func (s *Store) Stats() Stats {
-	var st Stats
+	st := Stats{JournalHealthy: true}
 	s.dataMu.RLock()
 	st.Namespaces = len(s.spaces)
-	for _, sp := range s.spaces {
-		st.Memories += sp.live
-	}
+	st.Memories = s.live
 	s.dataMu.RUnlock()
 	s.learnMu.Lock()
 	st.Pending = s.order.Len()
@@ -488,6 +639,9 @@ func (s *Store) Stats() Stats {
 	st.Weights = s.policy.Weights
 	s.learnMu.Unlock()
 	st.JournalErrors = s.journalErrors.Load()
+	if s.journal != nil {
+		st.JournalHealthy = s.journal.healthy()
+	}
 	return st
 }
 
