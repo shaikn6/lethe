@@ -1,0 +1,26 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - ineffassign
+    - errcheck
+  settings:
+    errcheck:
+      # Best-effort cleanup on error/shutdown paths, where there is no
+      # caller to report to; checked closes on the happy path stay checked.
+      exclude-functions:
+        - (*os.File).Close
+        - (io.Closer).Close
+        - (*github.com/shaikn6/lethe/internal/memory.journal).close
+        - (github.com/shaikn6/lethe/internal/memory.journalFile).Close
+        - os.Remove
+        - (*encoding/json.Encoder).Encode
+  exclusions:
+    rules:
+      # Test setup/teardown does not need every return value checked.
+      - path: _test\.go
+        linters:
+          - errcheck
