@@ -259,10 +259,13 @@ func TestCompactionDuringConcurrentUse(t *testing.T) {
 	s := open(t, Options{JournalPath: path, CompactAfter: 20})
 	const workers, rounds = 8, 120
 	var wg sync.WaitGroup
+	var compactWG sync.WaitGroup
 	var mu sync.Mutex
 	kept := 0
 	stop := make(chan struct{})
+	compactWG.Add(1)
 	go func() {
+		defer compactWG.Done()
 		for {
 			select {
 			case <-stop:
@@ -314,6 +317,7 @@ func TestCompactionDuringConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 	close(stop)
+	compactWG.Wait() // join the compactor before Close so it cannot call Compact on a closed store
 	st := s.Stats()
 	if st.Memories != kept || st.Updates != workers*rounds || st.JournalErrors != 0 {
 		t.Fatalf("stats = %+v, want %d memories and %d updates", st, kept, workers*rounds)
