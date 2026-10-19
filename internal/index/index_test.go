@@ -1,7 +1,9 @@
 package index
 
 import (
+	"fmt"
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -88,5 +90,19 @@ func TestSearchEdgeCases(t *testing.T) {
 	}
 	if !reflect.DeepEqual(ix.Search("one two", 3), ix.Search("two one one", 3)) {
 		t.Fatal("term order or repetition changed the result")
+	}
+}
+
+func TestSearchLimitIsPrefixOfFullRanking(t *testing.T) {
+	ix := New()
+	for i := range 300 {
+		ix.Add(fmt.Sprintf("deploy service %d status %d host %d", i%17, i%5, i%3)) // many equal scores
+	}
+	full := ix.Search("deploy service status", 1000)
+	for _, n := range []int{1, 7, 50, 299, 300} {
+		got := ix.Search("deploy service status", n)
+		if !slices.Equal(got, full[:n]) {
+			t.Fatalf("n=%d: top results differ from the full ranking", n)
+		}
 	}
 }

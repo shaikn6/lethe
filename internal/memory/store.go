@@ -22,6 +22,7 @@ import (
 
 	"github.com/shaikn6/lethe/internal/index"
 	"github.com/shaikn6/lethe/internal/policy"
+	"github.com/shaikn6/lethe/internal/topk"
 )
 
 // Limits on what a caller may store.
@@ -592,19 +593,20 @@ func (s *Store) candidates(q Query, asOf time.Time) ([]Memory, []policy.Features
 			doc uint32
 			cos float64
 		}
-		all := make([]scored, 0, sp.live)
+		// Only the best Candidates are wanted, so stream the scan through a
+		// bounded heap instead of sorting every vector in the namespace.
+		top := topk.New(s.opts.Candidates, func(a, b scored) bool {
+			if a.cos != b.cos {
+				return a.cos > b.cos
+			}
+			return a.doc < b.doc
+		})
 		for doc, e := range sp.entries {
 			if e.alive && e.norm > 0 {
-				all = append(all, scored{uint32(doc), cosine(q.Embedding, e.Embedding, qNorm, e.norm)})
+				top.Push(scored{uint32(doc), cosine(q.Embedding, e.Embedding, qNorm, e.norm)})
 			}
 		}
-		sort.Slice(all, func(i, j int) bool {
-			if all[i].cos != all[j].cos {
-				return all[i].cos > all[j].cos
-			}
-			return all[i].doc < all[j].doc
-		})
-		for i, sc := range all[:min(s.opts.Candidates, len(all))] {
+		for i, sc := range top.Sorted() {
 			semantic[sc.doc] = true
 			pool[sc.doc] = struct{}{}
 			if i < neighborSeeds {
