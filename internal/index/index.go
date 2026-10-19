@@ -4,9 +4,10 @@ package index
 
 import (
 	"math"
-	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/shaikn6/lethe/internal/topk"
 )
 
 const (
@@ -142,18 +143,15 @@ func (ix *Index) Search(query string, n int) []Scored {
 			scores[p.doc] += idf * tf * (k1 + 1) / (tf + norm)
 		}
 	}
-	hits := make([]Scored, 0, len(scores))
-	for doc, score := range scores {
-		hits = append(hits, Scored{Doc: doc, Score: score})
-	}
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].Score != hits[j].Score {
-			return hits[i].Score > hits[j].Score
+	// Only the best n are wanted, so keep those instead of sorting every hit.
+	top := topk.New(n, func(a, b Scored) bool {
+		if a.Score != b.Score {
+			return a.Score > b.Score
 		}
-		return hits[i].Doc < hits[j].Doc
+		return a.Doc < b.Doc
 	})
-	if n < len(hits) {
-		hits = hits[:n]
+	for doc, score := range scores {
+		top.Push(Scored{Doc: doc, Score: score})
 	}
-	return hits
+	return top.Sorted()
 }

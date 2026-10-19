@@ -26,6 +26,8 @@ jobs:
       - run: go test ./... -count=1 -race -coverprofile=coverage.out
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
+      - name: Benchmarks still run
+        run: go test ./internal/memory -run '^$' -bench BenchmarkRecall -benchtime=1x
 
   govulncheck:
     runs-on: ubuntu-latest
