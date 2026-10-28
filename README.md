@@ -35,7 +35,7 @@ What the two tables show together is narrower than "learning wins". The recipe t
 
 **Does it survive bad input?** A fuzz test sent 540,000 random request bodies at the API: no crash, no server error.
 
-**How fast is it?** On an Apple M2 Pro, 32 clients each looping store, recall, feedback for ten seconds: 7,119 requests per second, no failed requests, half of the three-request loops done within 12.5 ms and 99% within 31 ms. That is one laptop, loopback networking and 64-number embeddings, not a capacity claim. The load comes from `cmd/lethe-stress`; the command is under "To repeat the checks" below.
+**How fast is it?** On an Apple M2 Pro, 32 clients each looping store, recall, feedback for ten seconds: 8,700 to 9,000 requests per second across three runs on a fresh server (8,695, 8,795, 9,037), no failed requests, half of the three-request loops done within about 10 ms and 99% within about 23 ms. An earlier measurement of the same test gave 7,119. Runs on a server that already holds earlier runs' data are slower (8,594, 5,131, 3,878 in one sequence of three), because recall searches a growing store. That is one laptop, loopback networking and 64-number embeddings, not a capacity claim. The load comes from `cmd/lethe-stress`; the command is under "To repeat the checks" below.
 
 ## Read this before quoting a number
 
