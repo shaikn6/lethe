@@ -35,7 +35,7 @@ What the two tables show together is narrower than "learning wins". The recipe t
 
 **Does it survive bad input?** A fuzz test sent 540,000 random request bodies at the API: no crash, no server error.
 
-**How fast is it?** On an Apple M2 Pro, 32 clients each looping store, recall, feedback for ten seconds: 7,119 requests per second, no failed requests, half of the three-request loops done within 12.5 ms and 99% within 31 ms. That is one laptop, loopback networking and 64-number embeddings, not a capacity claim.
+**How fast is it?** On an Apple M2 Pro, 32 clients each looping store, recall, feedback for ten seconds: 7,119 requests per second, no failed requests, half of the three-request loops done within 12.5 ms and 99% within 31 ms. That is one laptop, loopback networking and 64-number embeddings, not a capacity claim. The load comes from `cmd/lethe-stress`; the command is under "To repeat the checks" below.
 
 ## Read this before quoting a number
 
@@ -47,7 +47,7 @@ What the two tables show together is narrower than "learning wins". The recipe t
 
 ## Run it
 
-Requires Go 1.26.
+Requires Go 1.26.10 or newer (the `go` line in go.mod). An older Go downloads 1.26.10 itself unless `GOTOOLCHAIN=local` is set, in which case the build stops.
 
 ```sh
 go build -o bin/lethed ./cmd/lethed
@@ -66,7 +66,13 @@ curl -s localhost:8787/v1/feedback -H "Authorization: Bearer change-me" \
 
 The server does not compute embeddings. Send one with each memory and query from whatever model you use, or send none and it ranks by keywords and neighbours alone.
 
-From Python, LangChain or an MCP client:
+From Python, LangChain or an MCP client. Install the Python client (package `lethe-memory`, Python 3.10+) from the repository root; the `langchain` extra adds `langchain-core` for `LetheRetriever`:
+
+```sh
+pip install './python[langchain]'
+```
+
+`my_embedder` below is any function from text to a list of floats; leave `embed` out to rank by keywords and neighbours alone.
 
 ```python
 from lethe import Lethe
@@ -92,6 +98,15 @@ go test -race ./...
 go test ./internal/server -run xxx -fuzz FuzzAPI -fuzztime 30s
 python -m venv bench/.venv && bench/.venv/bin/pip install -r bench/requirements.txt
 bench/.venv/bin/python bench/locomo.py          # needs data/locomo10.json from the LoCoMo repository
+```
+
+Throughput (the figure above came from an Apple M2 Pro, 10 cores, 16 GB; run it on an otherwise idle machine). Start the server without `LETHE_TOKEN`, because `lethe-stress` sends no `Authorization` header, and with a fresh journal:
+
+```sh
+go build -o bin/lethed ./cmd/lethed
+bin/lethed -journal /tmp/lethe-stress.journal &
+go run ./cmd/lethe-stress -url http://127.0.0.1:8787 -workers 32 -duration 10s   # prints requests_per_second, cycle_p50_ms, cycle_p99_ms, failed_requests
+kill %1; rm /tmp/lethe-stress.journal
 ```
 
 ## How it works
