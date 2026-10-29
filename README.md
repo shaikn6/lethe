@@ -1,10 +1,34 @@
 # lethe
 
-A memory server for AI agents that learns which memories to return.
+[![CI](https://github.com/shaikn6/lethe/actions/workflows/ci.yml/badge.svg)](https://github.com/shaikn6/lethe/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Live demo](https://img.shields.io/badge/Live%20demo-Hugging%20Face-FF9E0F)](https://huggingface.co/spaces/9mark9/lethe-agent-memory)
+
+**A memory server for AI agents that learns which memories to return: it ranks stored memories by keyword, embedding and neighbour signals, and a small policy-gradient learner re-weights that ranking from the agent's feedback.**
 
 An agent with long-term memory has to pick a handful of stored items to read before it answers. Most memory systems pick with a fixed recipe: some mix of keyword match and embedding similarity, perhaps with a bonus for recent items. lethe starts from the same recipe and then adjusts it from feedback. After each recall the agent says whether the memories helped, and a small reinforcement-learning policy shifts the ranking towards what works.
 
 It is one Go binary with a journal on disk, an HTTP API, and adapters for Python, LangChain and MCP.
+
+**At a glance:** on held-out [LoCoMo](https://github.com/snap-research/locomo) conversations the ranking learned from "which memories helped" puts 0.707 of the evidence in the top 10, against 0.641 for the best hand-set weights; on LongMemEval it only ties the best hand-set rule. Details, seeds and caveats are in [What has been measured](#what-has-been-measured).
+
+## Why this exists
+
+Retrieval for agent memory is usually a hand-tuned recipe, and the best recipe on one dataset can be the worst on another (the two tables below show exactly that). lethe tests whether an agent's own feedback, "these memories helped", can set the ranking instead, and measures where that holds and where it does not.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["Agent"] -->|"Python client, LangChain retriever"| S
+    MCP["cmd/lethe-mcp<br/>MCP over stdio"] -->|HTTP| S
+    S["cmd/lethed + internal/server<br/>HTTP API, bearer token"] --> M["internal/memory<br/>store, recall, feedback"]
+    M --> I["internal/index<br/>BM25 + embedding search"]
+    M --> P["internal/policy<br/>ranking weights, REINFORCE"]
+    M --> J[("append-only journal<br/>replayed on start")]
+    M -.->|"optional events"| K["internal/events<br/>Kafka"]
+```
 
 ## What has been measured
 
@@ -45,7 +69,7 @@ What the two tables show together is narrower than "learning wins". The recipe t
 - **One learned signal is untested here.** The policy also tracks how often each memory has helped before. Within one user's history that should help repeated questions; on conversations it has never seen it is constant, so this benchmark says nothing about it.
 - **The retrieval score is not answer quality.** No language model was asked to answer anything.
 
-## Run it
+## Quickstart
 
 Requires Go 1.26.10 or newer (the `go` line in go.mod). An older Go downloads 1.26.10 itself unless `GOTOOLCHAIN=local` is set, in which case the build stops.
 
@@ -127,6 +151,14 @@ kill %1; rm /tmp/lethe-stress.journal
 - **Embedding search is brute force**, fine up to roughly a hundred thousand memories per namespace and not beyond.
 - **The Kafka path has only met a stand-in broker** in tests, and the Terraform has been validated but never applied.
 - **One server, one journal.** There is no replication.
+
+## What I would improve next
+
+- Real feedback: the benchmark feedback is computed from evidence labels; the next test is feedback reported by an agent in live use.
+- Answer quality: score the answers a language model gives from the recalled memories, not only whether the evidence was returned.
+- Per-namespace access control, so a token can be limited to its own namespaces.
+- An approximate-nearest-neighbour index for namespaces beyond roughly a hundred thousand memories.
+- Replication of the journal, and a test of the Kafka path against a real broker.
 
 ## Licence
 
