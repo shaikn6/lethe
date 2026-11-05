@@ -57,11 +57,18 @@ func main() {
 	stats := store.Stats()
 	log.Info("store ready", "memories", stats.Memories, "policy_updates", stats.Updates, "addr", *addr)
 
+	scopes, err := server.ParseScopes(os.Getenv("LETHE_TOKEN_SCOPES"))
+	if err != nil {
+		log.Error("parse LETHE_TOKEN_SCOPES", "error", err)
+		os.Exit(1)
+	}
+
 	srv := &http.Server{
 		Addr: *addr,
 		Handler: server.New(store, server.Config{
 			Token:       os.Getenv("LETHE_TOKEN"),
 			AdminToken:  os.Getenv("LETHE_ADMIN_TOKEN"),
+			Scopes:      scopes,
 			MaxInFlight: *maxInFlight, EventCounters: counters,
 		}, log),
 		ReadHeaderTimeout: 5 * time.Second,
