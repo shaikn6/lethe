@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -133,6 +134,87 @@ func TestBearerToken(t *testing.T) {
 	}
 	if rec := do(h, "GET", "/healthz", ""); rec.Code != http.StatusOK {
 		t.Fatalf("healthz without token: %d, want 200", rec.Code)
+	}
+}
+
+func TestNamespaceScopes(t *testing.T) {
+	store, err := memory.Open(memory.Options{Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	cfg := Config{Scopes: map[string][]string{
+		"alice-token": {"alice"},
+		"ops-token":   {"*"},
+	}}
+	h := New(store, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	alice := []string{"Authorization", "Bearer alice-token"}
+	ops := []string{"Authorization", "Bearer ops-token"}
+
+	// A token with no namespaces configured for it fails authentication.
+	if rec := do(h, "POST", "/v1/recall", `{"namespace":"alice","query":"x"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: %d, want 401", rec.Code)
+	}
+	if rec := do(h, "POST", "/v1/recall", `{"namespace":"alice","query":"x"}`, "Authorization", "Bearer nope"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unknown token: %d, want 401", rec.Code)
+	}
+
+	// The alice-scoped token: 200 on its own namespace, 403 on another, for
+	// store, recall and delete.
+	rec := do(h, "POST", "/v1/memories", `{"namespace":"alice","text":"x"}`, alice...)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("store alice: %d %s", rec.Code, rec.Body)
+	}
+	var stored struct {
+		ID string `json:"id"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &stored)
+	if rec := do(h, "POST", "/v1/memories", `{"namespace":"bob","text":"x"}`, alice...); rec.Code != http.StatusForbidden {
+		t.Fatalf("store bob: %d, want 403", rec.Code)
+	}
+	if rec := do(h, "POST", "/v1/recall", `{"namespace":"alice","query":"x"}`, alice...); rec.Code != http.StatusOK {
+		t.Fatalf("recall alice: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do(h, "POST", "/v1/recall", `{"namespace":"bob","query":"x"}`, alice...); rec.Code != http.StatusForbidden {
+		t.Fatalf("recall bob: %d, want 403", rec.Code)
+	}
+	if rec := do(h, "DELETE", "/v1/memories/bob/"+stored.ID, "", alice...); rec.Code != http.StatusForbidden {
+		t.Fatalf("delete bob: %d, want 403", rec.Code)
+	}
+	if rec := do(h, "DELETE", "/v1/memories/alice/"+stored.ID, "", alice...); rec.Code != http.StatusNoContent {
+		t.Fatalf("delete alice: %d %s, want 204", rec.Code, rec.Body)
+	}
+
+	// A token scoped to "*" keeps the open behaviour on any namespace.
+	for _, ns := range []string{"alice", "bob", "carol"} {
+		if rec := do(h, "POST", "/v1/memories", `{"namespace":"`+ns+`","text":"x"}`, ops...); rec.Code != http.StatusCreated {
+			t.Fatalf("wildcard store %s: %d %s", ns, rec.Code, rec.Body)
+		}
+	}
+
+	// With no scoping configured the data endpoints stay open on any namespace.
+	open := New(store, Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if rec := do(open, "POST", "/v1/memories", `{"namespace":"anything","text":"x"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("open store: %d %s, want 201", rec.Code, rec.Body)
+	}
+}
+
+func TestParseScopes(t *testing.T) {
+	got, err := ParseScopes(" alice-token:alice,shared ; ops-token:* ")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := map[string][]string{"alice-token": {"alice", "shared"}, "ops-token": {"*"}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if got, err := ParseScopes(""); got != nil || err != nil {
+		t.Fatalf("empty = (%v, %v), want (nil, nil)", got, err)
+	}
+	for _, bad := range []string{"no-colon", ":alice", "token:"} {
+		if _, err := ParseScopes(bad); err == nil {
+			t.Errorf("ParseScopes(%q) = nil error, want an error", bad)
+		}
 	}
 }
 

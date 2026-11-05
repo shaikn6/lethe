@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -58,6 +60,12 @@ type Config struct {
 	// for everyone: setting the ranking weights and forcing a compaction.
 	// Empty switches those endpoints off.
 	AdminToken string
+	// Scopes optionally limits data tokens to a set of namespaces. Each key is
+	// a bearer token and its value is the namespaces that token may touch; a
+	// value of {"*"} grants every namespace. When Scopes is empty the data
+	// endpoints behave exactly as before: Token alone guards them and grants
+	// all namespaces. See ParseScopes for the LETHE_TOKEN_SCOPES format.
+	Scopes map[string][]string
 	// MaxInFlight is how many requests are served at once before the rest
 	// are turned away with 503. Default 256.
 	MaxInFlight int
@@ -102,6 +110,10 @@ func New(store *memory.Store, cfg Config, log *slog.Logger) http.Handler {
 		if !decode(w, r, &req) {
 			return
 		}
+		if !namespaceAllowed(r, req.Namespace) {
+			forbidNamespace(w)
+			return
+		}
 		importance := 0.5
 		if req.Importance != nil {
 			importance = *req.Importance
@@ -119,6 +131,10 @@ func New(store *memory.Store, cfg Config, log *slog.Logger) http.Handler {
 	})
 
 	mux.HandleFunc("DELETE /v1/memories/{namespace}/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if !namespaceAllowed(r, r.PathValue("namespace")) {
+			forbidNamespace(w)
+			return
+		}
 		if err := store.Forget(r.PathValue("namespace"), r.PathValue("id")); err != nil {
 			writeError(w, log, err)
 			return
@@ -129,6 +145,10 @@ func New(store *memory.Store, cfg Config, log *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /v1/recall", func(w http.ResponseWriter, r *http.Request) {
 		var req recallRequest
 		if !decode(w, r, &req) {
+			return
+		}
+		if !namespaceAllowed(r, req.Namespace) {
+			forbidNamespace(w)
 			return
 		}
 		if req.K == 0 {
@@ -166,7 +186,7 @@ func New(store *memory.Store, cfg Config, log *slog.Logger) http.Handler {
 	})
 
 	root := http.NewServeMux()
-	root.Handle("/", authorize(cfg.Token, mux))
+	root.Handle("/", authorizeData(cfg.Token, scopeSets(cfg.Scopes), mux))
 	if cfg.AdminToken != "" {
 		admin := http.NewServeMux()
 		var lastCompact atomic.Int64
@@ -244,6 +264,125 @@ func authorize(token string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// ctxKey is unexported so nothing outside this package can set the values it
+// marks in a request context.
+type ctxKey int
+
+// allowedNamespacesKey marks the set of namespaces the caller's token may
+// touch. It is absent when the token is unrestricted, which the handlers read
+// as "every namespace is allowed".
+const allowedNamespacesKey ctxKey = iota
+
+// scopeSets turns the configured token->namespaces lists into token->set
+// lookups. A list containing "*" becomes a nil set, meaning the token is
+// authenticated but not restricted to any namespace.
+func scopeSets(scopes map[string][]string) map[string]map[string]bool {
+	if len(scopes) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]bool, len(scopes))
+	for tok, names := range scopes {
+		set := make(map[string]bool, len(names))
+		for _, n := range names {
+			if n == "*" {
+				set = nil
+				break
+			}
+			set[n] = true
+		}
+		out[tok] = set
+	}
+	return out
+}
+
+// authorizeData guards the data endpoints. A request authenticates with the
+// open-access Token (which grants every namespace) or with any token in
+// scopes. A scoped token is recorded in the request context so the handlers
+// can refuse namespaces outside its set. With no Token and no scopes the
+// endpoints stay open, exactly as before.
+func authorizeData(token string, scopes map[string]map[string]bool, next http.Handler) http.Handler {
+	if token == "" && len(scopes) == 0 {
+		return next
+	}
+	want := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got := []byte(r.Header.Get("Authorization"))
+		authed := token != "" && subtle.ConstantTimeCompare(got, want) == 1
+		var restrictTo map[string]bool
+		restricted := false
+		// Every candidate is compared so the time taken does not reveal which
+		// token, if any, matched.
+		for tok, set := range scopes {
+			if subtle.ConstantTimeCompare(got, []byte("Bearer "+tok)) == 1 {
+				authed = true
+				if set != nil {
+					restrictTo, restricted = set, true
+				}
+			}
+		}
+		if !authed {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if restricted {
+			r = r.WithContext(context.WithValue(r.Context(), allowedNamespacesKey, restrictTo))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// namespaceAllowed reports whether the caller's token may touch ns. A request
+// with no recorded restriction (an unrestricted token, or no scoping at all)
+// is allowed every namespace.
+func namespaceAllowed(r *http.Request, ns string) bool {
+	allowed, ok := r.Context().Value(allowedNamespacesKey).(map[string]bool)
+	if !ok {
+		return true
+	}
+	return allowed[ns]
+}
+
+func forbidNamespace(w http.ResponseWriter) {
+	http.Error(w, "namespace not allowed for this token", http.StatusForbidden)
+}
+
+// ParseScopes reads the LETHE_TOKEN_SCOPES value: semicolon-separated entries,
+// each "token:ns1,ns2". A namespace of "*" grants every namespace. An empty
+// string means no scoping. Example: "alice-token:alice;ops-token:*".
+func ParseScopes(s string) (map[string][]string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	out := map[string][]string{}
+	for _, entry := range strings.Split(s, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		tok, rest, ok := strings.Cut(entry, ":")
+		tok = strings.TrimSpace(tok)
+		if !ok || tok == "" {
+			return nil, fmt.Errorf("token scope %q must be token:namespaces", entry)
+		}
+		var names []string
+		for _, n := range strings.Split(rest, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				names = append(names, n)
+			}
+		}
+		if len(names) == 0 {
+			return nil, fmt.Errorf("token scope %q lists no namespaces", entry)
+		}
+		out[tok] = names
+	}
+	return out, nil
 }
 
 // recoverPanics keeps one failing request from taking the process down.

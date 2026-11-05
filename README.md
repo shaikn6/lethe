@@ -78,6 +78,12 @@ go build -o bin/lethed ./cmd/lethed
 LETHE_TOKEN=change-me bin/lethed -journal lethe.journal        # listens on 127.0.0.1:8787
 ```
 
+`LETHE_TOKEN` grants every namespace. To limit a token to its own namespaces, set `LETHE_TOKEN_SCOPES` to semicolon-separated `token:ns1,ns2` entries (a namespace of `*` grants all); a scoped token gets `403` on any other namespace, while `LETHE_TOKEN` keeps full access.
+
+```sh
+LETHE_TOKEN=change-me LETHE_TOKEN_SCOPES='alice-token:alice;ops-token:*' bin/lethed
+```
+
 ```sh
 # store, recall, say what helped
 curl -s localhost:8787/v1/memories -H "Authorization: Bearer change-me" \
@@ -147,7 +153,7 @@ kill %1; rm /tmp/lethe-stress.journal
 
 ## Limits
 
-- **Namespaces separate data, not tenants.** Anyone holding the API token can read and write every namespace.
+- **Namespaces separate data, not tenants.** A full API token reads and writes every namespace; set `LETHE_TOKEN_SCOPES` to limit a token to its own namespaces.
 - **Embedding search is brute force**, fine up to roughly a hundred thousand memories per namespace and not beyond.
 - **The Kafka path has only met a stand-in broker** in tests, and the Terraform has been validated but never applied.
 - **One server, one journal.** There is no replication.
@@ -156,7 +162,6 @@ kill %1; rm /tmp/lethe-stress.journal
 
 - Real feedback: the benchmark feedback is computed from evidence labels; the next test is feedback reported by an agent in live use.
 - Answer quality: score the answers a language model gives from the recalled memories, not only whether the evidence was returned.
-- Per-namespace access control, so a token can be limited to its own namespaces.
 - An approximate-nearest-neighbour index for namespaces beyond roughly a hundred thousand memories.
 - Replication of the journal, and a test of the Kafka path against a real broker.
 
