@@ -170,3 +170,6 @@ kill %1; rm /tmp/lethe-stress.journal
 ## Licence
 
 MIT. See `LICENSE`.
+
+---
+<sub>Part of [Nagizaaz Shaik's open-source work](https://github.com/shaikn6) · [all repositories](https://github.com/shaikn6?tab=repositories)</sub>
