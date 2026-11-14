@@ -1,5 +1,7 @@
 # lethe
 
+> **An agent memory server that learns from feedback which memories are worth returning. Go, with Python/LangChain/MCP adapters.**
+
 [![CI](https://github.com/shaikn6/lethe/actions/workflows/ci.yml/badge.svg)](https://github.com/shaikn6/lethe/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
