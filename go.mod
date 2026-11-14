@@ -1,6 +1,6 @@
 module github.com/shaikn6/lethe
 
-go 1.26.10
+go 1.26.11
 
 require github.com/twmb/franz-go v1.22.2
 
