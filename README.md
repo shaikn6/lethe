@@ -73,7 +73,7 @@ What the two tables show together is narrower than "learning wins". The recipe t
 
 ## Quickstart
 
-Requires Go 1.26.10 or newer (the `go` line in go.mod). An older Go downloads 1.26.10 itself unless `GOTOOLCHAIN=local` is set, in which case the build stops.
+Requires Go 1.26.11 or newer (the `go` line in go.mod). An older Go downloads 1.26.11 itself unless `GOTOOLCHAIN=local` is set, in which case the build stops.
 
 ```sh
 go build -o bin/lethed ./cmd/lethed

@@ -91,16 +91,20 @@ func main() {
 		all = append(all, l...)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
-	pct := func(p float64) time.Duration {
-		if len(all) == 0 {
-			return 0
-		}
-		return all[int(float64(len(all)-1)*p)]
-	}
 	result := map[string]any{
 		"acknowledged_writes": acked.Load(), "recalls": recalls.Load(), "failed_requests": failed.Load(),
 		"requests_per_second": float64(acked.Load()+2*recalls.Load()) / duration.Seconds(),
-		"cycle_p50_ms":        float64(pct(0.50).Microseconds()) / 1000, "cycle_p99_ms": float64(pct(0.99).Microseconds()) / 1000,
+		"cycle_p50_ms":        float64(percentile(all, 0.50).Microseconds()) / 1000, "cycle_p99_ms": float64(percentile(all, 0.99).Microseconds()) / 1000,
 	}
 	json.NewEncoder(os.Stdout).Encode(result)
+}
+
+// percentile returns the p-quantile (p in [0, 1]) of sorted by nearest rank on
+// the index range [0, len-1]. sorted must be in ascending order. An empty
+// slice gives 0.
+func percentile(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[int(float64(len(sorted)-1)*p)]
 }
