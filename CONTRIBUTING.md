@@ -4,7 +4,7 @@ Thanks for taking the time to contribute.
 
 ## Development setup
 
-Go 1.26.10 or newer (the `go` line in `go.mod`).
+Go 1.26.11 or newer (the `go` line in `go.mod`).
 
 ```bash
 go build ./...
