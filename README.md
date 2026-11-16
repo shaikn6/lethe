@@ -34,32 +34,36 @@ flowchart LR
 
 ## What has been measured
 
-**Does the learning help?** On [LoCoMo](https://github.com/snap-research/locomo) (ten long conversations, 5,882 stored turns, 1,535 questions with labelled evidence), the score is how much of the evidence is among the returned memories. The learned ranking was trained with feedback on eight conversations and measured, with learning switched off, on the two it had never seen; all five such splits, five seeds.
+**Does the learning help?** On [LoCoMo](https://github.com/snap-research/locomo) (ten long conversations, 5,882 stored turns, 1,535 questions with labelled evidence), the score is how much of the evidence is among the returned memories. The learned ranking was trained with feedback on eight conversations and measured, with learning switched off, on the two it had never seen; all five such splits, five seeds. Every figure below is in [`bench/results/locomo_20261012_234229.json`](bench/results/locomo_20261012_234229.json).
 
 | Ranking                                    | Evidence in top 5 | Evidence in top 10 |
 | ------------------------------------------ | ----------------- | ------------------ |
 | Keyword only                               | 0.438             | 0.512              |
 | Embedding similarity only                  | 0.479             | 0.585              |
 | Equal mix of both                          | 0.493             | 0.570              |
+| Mix + recency, hand-set weights            | 0.486             | 0.564              |
 | Mix + neighbouring turns, hand-set weights | 0.545             | 0.641              |
-| Learned from one score per recall          | 0.568 ± 0.006     | 0.658 ± 0.004      |
-| **Learned from "which memories helped"**   | **0.618 ± 0.002** | **0.707 ± 0.003**  |
+| Learned from one score per recall          | 0.567 ± 0.006     | 0.658 ± 0.004      |
+| **Learned from "which memories helped"**   | **0.618 ± 0.002** | **0.707 ± 0.002**  |
 
-**Does that hold on other data?** Only partly. On [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (470 questions, each with its own chat history of about 500 turns; three seeds), the learned ranking ties the best hand-set rule and does not beat it.
+**Does that hold on other data?** Only partly. On [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (479 questions that have evidence to find, each with its own chat history of about 500 turns; three seeds), the learned ranking ties the best hand-set rule and does not beat it. Figures from [`bench/results/longmemeval_20261013_001648.json`](bench/results/longmemeval_20261013_001648.json).
 
 | Ranking | Evidence in top 5 | Evidence in top 10 |
 |---|---|---|
 | Keyword only | 0.681 | 0.789 |
 | Embedding similarity only | 0.707 | 0.845 |
 | Equal mix of both | 0.727 | 0.832 |
+| Mix + recency, hand-set weights | 0.722 | 0.826 |
 | Mix + neighbouring turns, hand-set weights | 0.687 | 0.817 |
 | Learned from "which memories helped" | 0.729 ± 0.021 | 0.847 ± 0.022 |
 
-What the two tables show together is narrower than "learning wins". The recipe that was best by hand on LoCoMo (neighbours) is the worst mix on LongMemEval, and the other way round. The learned ranking ended level with the best hand-set rule on one dataset and ahead of it on the other without being told which recipe suited which data. On LongMemEval it also varies more between seeds than the fixed rules do, with only 376 training questions per split.
+Both result files were produced on 2026-10-12 by the scripts in `bench/` and the server code at commit `3595364`; they have not been re-run since. Later commits changed ranking code only in `2b4d909` (keep the best k candidates instead of sorting all of them, meant to give the same order).
 
-**Does it survive a crash?** The server was killed with `kill -9` in the middle of 32 clients writing, three times. Every memory it had acknowledged was there after restart (9,725, 11,110 and 11,862 of them), and the journal was intact.
+What the two tables show together is narrower than "learning wins". The recipe that was best by hand on LoCoMo (neighbours) is the worst of the three mixes on LongMemEval, and the best rules on LongMemEval (equal mix for the top 5, embedding only for the top 10) are not the best on LoCoMo. The learned ranking ended level with the best hand-set rule on one dataset and ahead of it on the other without being told which recipe suited which data. On LongMemEval it also varies more between seeds than the fixed rules do, with only about 383 training questions per split.
 
-**Does it survive bad input?** A fuzz test sent 540,000 random request bodies at the API: no crash, no server error.
+**Does it survive a crash?** The server was killed with `kill -9` in the middle of 32 clients writing, three times. Every memory it had acknowledged was there after restart (9,725, 11,110 and 11,862 of them), and the journal was intact. This was a manual run on 2026-10-12; the script for it is not in the repository.
+
+**Does it survive bad input?** A fuzz test (`FuzzAPI`) sent 540,000 random request bodies at the API in a manual run on 2026-10-12: no crash, no server error. The 30-second command under "To repeat the checks" sends about 300,000.
 
 **How fast is it?** On an Apple M2 Pro, 32 clients each looping store, recall, feedback for ten seconds: 8,700 to 9,000 requests per second across three runs on a fresh server (8,695, 8,795, 9,037), no failed requests, half of the three-request loops done within about 10 ms and 99% within about 23 ms. An earlier measurement of the same test gave 7,119. Runs on a server that already holds earlier runs' data are slower (8,594, 5,131, 3,878 in one sequence of three), because recall searches a growing store. That is one laptop, loopback networking and 64-number embeddings, not a capacity claim. The load comes from `cmd/lethe-stress`; the command is under "To repeat the checks" below.
 
@@ -129,7 +133,9 @@ To repeat the checks:
 go test -race ./...
 go test ./internal/server -run xxx -fuzz FuzzAPI -fuzztime 30s
 python -m venv bench/.venv && bench/.venv/bin/pip install -r bench/requirements.txt
+go build -o bin/lethed ./cmd/lethed                # the harnesses start bin/lethed on a free port
 bench/.venv/bin/python bench/locomo.py          # needs data/locomo10.json from the LoCoMo repository
+bench/.venv/bin/python bench/longmemeval.py     # needs data/longmemeval_s.json from the LongMemEval release
 ```
 
 Throughput (the figure above came from an Apple M2 Pro, 10 cores, 16 GB; run it on an otherwise idle machine). Start the server without `LETHE_TOKEN`, because `lethe-stress` sends no `Authorization` header, and with a fresh journal:
